@@ -1,0 +1,300 @@
+--- ../cuda/csrc/layer_norm.cu	2023-05-16 23:55:02.420152362 -0700
++++ ../sycl/csrc/layer_norm.cpp	2023-05-16 23:48:19.744462986 -0700
+@@ -1,15 +1,13 @@
+-// Copyright (c) Microsoft Corporation.
+-// SPDX-License-Identifier: Apache-2.0
+-
+-// DeepSpeed Team
++/*
++Copyright 2022 The Microsoft DeepSpeed Team
++*/
+ 
++#include "compatible.h"
+ #include "conversion_utils.h"
+-#include "ds_kernel_utils.h"
+-#include "inference_cuda_layers.h"
++#include "inference_sycl_layers.h"
+ #include "memory_access_utils.h"
+ #include "reduction_utils.h"
+ 
+-namespace cg = cooperative_groups;
+ using rop = reduce::ROpType;
+ 
+ namespace ln {
+@@ -29,21 +27,37 @@
+     elems_per_row: number of elements each block will normalize
+ */
+ template <typename T, int unRoll, int threadsPerGroup, int maxThreads>
+-__global__ void fused_ln(T *output, const T *vals, const T *gamma,
+-                         const T *beta, float epsilon, int elems_per_row) {
++class fused_ln {
++  T *output;
++  const T *vals;
++  const T *gamma;
++  const T *beta;
++  float epsilon;
++  int elems_per_row;
++
++public:
++  fused_ln(T *output, const T *vals, const T *gamma, const T *beta,
++           float epsilon, int elems_per_row)
++      : output(output), vals(vals), gamma(gamma), beta(beta), epsilon(epsilon),
++        elems_per_row(elems_per_row){};
++
++  void operator()(sycl::nd_item<2> pos) const {
+   constexpr int T_per_load = ln::granularity / sizeof(T);
+ 
+-  cg::thread_block tb = cg::this_thread_block();
+-  cg::thread_block_tile<hw_warp_size> warp =
+-      cg::tiled_partition<hw_warp_size>(tb);
++
++    auto tb = pos.get_group();
++    auto warp = sycl::ext::oneapi::experimental::this_sub_group();
+ 
+   // X-dimension of the block
++    /* const int block_offset = (tb.group_index().x * (maxThreads /
++     * threadsPerGroup) * elems_per_row) + */
++
+   const int block_offset =
+-      (tb.group_index().x * (maxThreads / threadsPerGroup) * elems_per_row) +
+-      (tb.thread_index().y * elems_per_row);
+-  const int thread_offset = tb.thread_index().x * T_per_load;
++        (tb.get_group_id(1) * (maxThreads / threadsPerGroup) * elems_per_row) +
++        (tb.get_local_id(0) * elems_per_row);
++    const int thread_offset = tb.get_local_id(1) * T_per_load;
+   const int base_offset = block_offset + thread_offset;
+-  const int stride = tb.size() * T_per_load;
++    const int stride = tb.get_local_linear_range() * T_per_load;
+ 
+   float sum = reduce::init<rop::Add, float>();
+ 
+@@ -88,7 +102,7 @@
+ 
+   reduce::partitioned_block<rop::Add, threadsPerGroup>(tb, warp, mean_diff);
+   const float variance = mean_diff / elems_per_row;
+-  const float denom = __frsqrt_rn(variance + epsilon);
++    const float denom = rsqrt(variance + epsilon);
+ 
+   const T mean_compute = conversion::to<T>(mean);
+   const T denom_compute = conversion::to<T>(denom);
+@@ -121,23 +135,29 @@
+                                                 iteration_buffer);
+     }
+   }
+-}
++  };
++};
++
+ 
+ #define LAUNCH_FUSED_LN(unRollFactor, threadsPerGroup, maxThreads)             \
+-  fused_ln<T, unRollFactor, threadsPerGroup, maxThreads>                       \
+-      <<<grid, block, 0, stream>>>(output, vals, gamma, beta, epsilon,         \
+-                                   elems_per_row);
++  {                                                                            \
++    fused_ln<T, unRollFactor, threadsPerGroup, maxThreads> fn(                 \
++        output, vals, gamma, beta, epsilon, elems_per_row);                    \
++    stream.submit([&](sycl::handler &cmd_list) {                               \
++      cmd_list.parallel_for(sycl::nd_range<2>{grid, block}, fn);               \
++    });                                                                        \
++  }
+ 
+ template <typename T>
+ void launch_fused_ln(T *output, const T *vals, const T *gamma, const T *beta,
+                      float epsilon, int rows, int elems_per_row,
+-                     cudaStream_t stream) {
+-  // 8 for __half, 4 for float
++                     sycl::queue stream) {
++  // 8 for sycl::half, 4 for float
+   constexpr int T_per_load = ln::granularity / sizeof(T);
+ 
+   constexpr int maxThreads = 256;
+ 
+-  // For Flaoat, unRoll 4, for __half, unRoll 2
++  // For Flaoat, unRoll 4, for sycl::half, unRoll 2
+   constexpr int internal_unRoll = sizeof(T) == 4 ? 4 : 2;
+ 
+   const bool is_subblock_schedule = (elems_per_row <= 128) ? true : false;
+@@ -160,8 +180,10 @@
+       (rows < groups_per_block_max) ? rows : groups_per_block_max;
+   const int groups_launch = (groups_per_block + rows - 1) / groups_per_block;
+ 
+-  dim3 block(threadsPerGroup, groups_per_block);
+-  dim3 grid(groups_launch);
++  sycl::range<2> block{(unsigned long)groups_per_block,
++                       (size_t)threadsPerGroup};
++  sycl::range<2> grid{(unsigned long)groups_per_block,
++                      (size_t)(threadsPerGroup * groups_launch)};
+ 
+   const int elems_per_step = threadsPerGroup * h_per_step;
+   const int external_unRoll =
+@@ -196,15 +218,13 @@
+   }
+ }
+ 
+-template void launch_fused_ln(__half *, const __half *, const __half *,
+-                              const __half *, float, int, int, cudaStream_t);
+-#ifdef BF16_AVAILABLE
+-template void launch_fused_ln(__nv_bfloat16 *, const __nv_bfloat16 *,
+-                              const __nv_bfloat16 *, const __nv_bfloat16 *,
+-                              float, int, int, cudaStream_t);
+-#endif
++template void launch_fused_ln(sycl::half *, const sycl::half *,
++                              const sycl::half *, const sycl::half *, float,
++                              int, int, sycl::queue);
++template void launch_fused_ln(bf16 *, const bf16 *, const bf16 *, const bf16 *,
++                              float, int, int, sycl::queue);
+ template void launch_fused_ln(float *, const float *, const float *,
+-                              const float *, float, int, int, cudaStream_t);
++                              const float *, float, int, int, sycl::queue);
+ 
+ /*
+ Fused resiual + bias + layer norm implementation. Assumes elems_per_row % 8
+@@ -229,23 +249,41 @@
+ */
+ template <typename T, int unRoll, int threadsPerGroup, int maxThreads,
+           bool preLnResidual>
+-__global__ void fused_residual_ln(T *output, T *res_output, const T *vals,
+-                                  const T *residual, const T *bias,
+-                                  const T *gamma, const T *beta, float epsilon,
+-                                  int elems_per_row) {
++class fused_residual_ln {
++
++private:
++  T *output;
++  T *res_output;
++  const T *vals;
++  const T *residual;
++  const T *bias;
++  const T *gamma;
++  const T *beta;
++  float epsilon;
++  int elems_per_row;
++
++public:
++  fused_residual_ln(T *output, T *res_output, const T *vals, const T *residual,
++                    const T *bias, const T *gamma, const T *beta, float epsilon,
++                    int elems_per_row)
++      : output(output), res_output(res_output), vals(vals), residual(residual),
++        bias(bias), gamma(gamma), beta(beta), epsilon(epsilon),
++        elems_per_row(elems_per_row){};
++
++  void operator()(sycl::nd_item<2> pos) const {
++
+   constexpr int T_per_load = ln::granularity / sizeof(T);
+ 
+-  cg::thread_block tb = cg::this_thread_block();
+-  cg::thread_block_tile<hw_warp_size> warp =
+-      cg::tiled_partition<hw_warp_size>(tb);
++    auto tb = pos.get_group();
++    auto warp = sycl::ext::oneapi::experimental::this_sub_group();
+ 
+   // X-dimension of the block
+   const int block_offset =
+-      (tb.group_index().x * (maxThreads / threadsPerGroup) * elems_per_row) +
+-      (tb.thread_index().y * elems_per_row);
+-  const int thread_offset = tb.thread_index().x * T_per_load;
++        (tb.get_group_id(1) * (maxThreads / threadsPerGroup) * elems_per_row) +
++        (tb.get_local_id(0) * elems_per_row);
++    const int thread_offset = tb.get_local_id(1) * T_per_load;
+   const int base_offset = block_offset + thread_offset;
+-  const int stride = tb.size() * T_per_load;
++    const int stride = tb.get_local_linear_range() * T_per_load;
+ 
+   float sum = reduce::init<rop::Add, float>();
+ 
+@@ -309,7 +347,7 @@
+ 
+   reduce::partitioned_block<rop::Add, threadsPerGroup>(tb, warp, mean_diff);
+   const float variance = mean_diff / elems_per_row;
+-  const float denom = __frsqrt_rn(variance + epsilon);
++    const float denom = rsqrt(variance + epsilon);
+ 
+   const T mean_compute = conversion::to<T>(mean);
+   const T denom_compute = conversion::to<T>(denom);
+@@ -342,26 +380,32 @@
+                                                 iteration_buffer);
+     }
+   }
+-}
++  };
++};
+ 
+ // TODO(cmikeh2): There's a bunch of redundancy here that needs to be
+ // removed/simplified.
+ #define LAUNCH_FUSED_RES_LN(unRollFactor, threadsPerGroup, maxThreads)         \
+-  fused_residual_ln<T, unRollFactor, threadsPerGroup, maxThreads, false>       \
+-      <<<grid, block, 0, stream>>>(output, nullptr, vals, residual, bias,      \
+-                                   gamma, beta, epsilon, elems_per_row);
++  {                                                                            \
++    fused_residual_ln<T, unRollFactor, threadsPerGroup, maxThreads, false> fn( \
++        output, nullptr, vals, residual, bias, gamma, beta, epsilon,           \
++        elems_per_row);                                                        \
++    stream.submit([&](sycl::handler &cmd_list) {                               \
++      cmd_list.parallel_for(sycl::nd_range<2>{grid, block}, fn);               \
++    });                                                                        \
++  }
+ 
+ template <typename T>
+ void launch_fused_residual_ln(T *output, const T *vals, const T *residual,
+                               const T *bias, const T *gamma, const T *beta,
+                               float epsilon, int rows, int elems_per_row,
+-                              cudaStream_t stream) {
+-  // 8 for __half, 4 for float
++                              sycl::queue stream) {
++  // 8 for sycl::half, 4 for float
+   constexpr int T_per_load = ln::granularity / sizeof(T);
+ 
+   constexpr int maxThreads = 256;
+ 
+-  // For Flaoat, unRoll 4, for __half, unRoll 2
++  // For Flaoat, unRoll 4, for sycl::half, unRoll 2
+   constexpr int internal_unRoll = sizeof(T) == 4 ? 4 : 2;
+ 
+   const bool is_subblock_schedule = (elems_per_row <= 128) ? true : false;
+@@ -384,8 +428,10 @@
+       (rows < groups_per_block_max) ? rows : groups_per_block_max;
+   const int groups_launch = (groups_per_block + rows - 1) / groups_per_block;
+ 
+-  dim3 block(threadsPerGroup, groups_per_block);
+-  dim3 grid(groups_launch);
++  sycl::range<2> block{(unsigned long)groups_per_block,
++                       (size_t)threadsPerGroup};
++  sycl::range<2> grid{(unsigned long)groups_per_block,
++                      (size_t)(threadsPerGroup * groups_launch)};
+ 
+   const int elems_per_step = threadsPerGroup * h_per_step;
+   const int external_unRoll =
+@@ -420,24 +466,17 @@
+   }
+ }
+ 
+-
+-
+ // No-store specializations
+-template void launch_fused_residual_ln(__half *, const __half *, const __half *,
+-                                       const __half *, const __half *,
+-                                       const __half *, float, int, int,
+-                                       cudaStream_t);
+-
+-#ifdef BF16_AVAILABLE
+-template void launch_fused_residual_ln(__nv_bfloat16 *, const __nv_bfloat16 *,
+-                                       const __nv_bfloat16 *,
+-                                       const __nv_bfloat16 *,
+-                                       const __nv_bfloat16 *,
+-                                       const __nv_bfloat16 *, float, int, int,
+-                                       cudaStream_t);
+-#endif
++template void launch_fused_residual_ln(sycl::half *, const sycl::half *,
++                                       const sycl::half *, const sycl::half *,
++                                       const sycl::half *, const sycl::half *,
++                                       float, int, int, sycl::queue);
++
++template void launch_fused_residual_ln(bf16 *, const bf16 *, const bf16 *,
++                                       const bf16 *, const bf16 *, const bf16 *,
++                                       float, int, int, sycl::queue);
+ 
+ template void launch_fused_residual_ln(float *, const float *, const float *,
+                                        const float *, const float *,
+                                        const float *, float, int, int,
+-                                       cudaStream_t);
++                                       sycl::queue);
