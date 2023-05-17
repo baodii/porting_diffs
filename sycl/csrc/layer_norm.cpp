@@ -1,6 +1,7 @@
-/*
-Copyright 2022 The Microsoft DeepSpeed Team
-*/
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
 
 #include "compatible.h"
 #include "conversion_utils.h"
@@ -49,9 +50,6 @@ public:
     auto warp = sycl::ext::oneapi::experimental::this_sub_group();
 
     // X-dimension of the block
-    /* const int block_offset = (tb.group_index().x * (maxThreads /
-     * threadsPerGroup) * elems_per_row) + */
-
     const int block_offset =
         (tb.get_group_id(1) * (maxThreads / threadsPerGroup) * elems_per_row) +
         (tb.get_local_id(0) * elems_per_row);

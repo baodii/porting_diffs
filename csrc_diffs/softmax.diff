@@ -1,17 +1,11 @@
---- ../cuda/csrc/softmax.cu	2023-05-17 00:08:09.915454190 -0700
-+++ ../sycl/csrc/softmax.cpp	2023-05-17 00:18:06.425020150 -0700
-@@ -1,62 +1,98 @@
--// Copyright (c) Microsoft Corporation.
--// SPDX-License-Identifier: Apache-2.0
-+/*
-+Copyright 2022 The Microsoft DeepSpeed Team
-+*/
+--- cuda/csrc/softmax.cu	2023-05-17 06:56:01.108607409 -0700
++++ sycl/csrc/softmax.cpp	2023-05-17 06:54:42.871865251 -0700
+@@ -4,35 +4,50 @@
+ // DeepSpeed Team
  
--// DeepSpeed Team
--
+ #include <limits>
 -#include "conversion_utils.h"
 -#include "inference_cuda_layers.h"
- #include <limits>
  
 -#ifndef __HIP_PLATFORM_HCC__
 -#include <cuda_profiler_api.h>
@@ -21,6 +15,17 @@
  #include <ctime>
  
 -#define MAX_REG_SIZE 8
+-
+-#define minus_infinity -10000.0
+-
+-void CheckCudaErrorAux(const char* file, unsigned line)
+-{
+-    cudaError_t err = cudaGetLastError();
+-    if (err == cudaSuccess) return;
+-    std::cerr << cudaGetErrorString(err) << "(" << err << ") at " << file << ":" << line
+-              << std::endl;
+-    throw std::runtime_error("CUDA ERROR!!!\n");
+-}
 +#if __has_include(<sycl/sycl.hpp>)
 +#include <sycl/sycl.hpp>
 +using namespace sycl;
@@ -31,810 +36,619 @@
 +#error "Unsupported compiler"
 +#endif
  
--#define minus_infinity -10000.0
+-#define CUDA_CHECK_ERROR() CheckCudaErrorAux(__FILE__, __LINE__)
 +#include "compatible.h"
 +#include "conversion_utils.h"
 +#include "inference_sycl_layers.h"
  
+-namespace cg = cooperative_groups;
 +#define MAX_REG_SIZE 8
 +#define minus_infinity -10000.0
  
--namespace cg = cooperative_groups;
-+template <typename T, int iterations> class attn_softmax_v2 {
+ template <typename T, int iterations>
+-__global__ void attn_softmax_v2(T* vals,
++class attn_softmax_v2 {
 +private:
-+  T *vals;
-+  T *mask;
-+  T *alibi;
-+  float layer_scale;
-+  bool triangular;
-+  bool recompute;
-+  bool local_attention;
-+  int window_size;
-+  int total_count;
-+  int heads;
-+  int sequence_length;
-+  int num_seq;
-+  int head_offset;
-+  int mask_stride;
-+  int mp_size;
-+  int reduceWidth;
- 
--template <typename T, int iterations>
--__global__ void attn_softmax_v2(T *vals, T *mask, T *alibi, float layer_scale,
--                                bool triangular, bool recompute,
--                                bool local_attention, int window_size,
--                                int total_count, int heads, int sequence_length,
--                                int num_seq, int head_offset, int mask_stride,
--                                int mp_size, int reduceWidth) {
--  cg::thread_block b = cg::this_thread_block();
--  cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
-+public:
-+  attn_softmax_v2(T *vals, T *mask, T *alibi, float layer_scale,
-+                  bool triangular, bool recompute, bool local_attention,
-+                  int window_size, int total_count, int heads,
-+                  int sequence_length, int num_seq, int head_offset,
-+                  int mask_stride, int mp_size, int reduceWidth)
-+      : vals(vals), mask(mask), alibi(alibi), layer_scale(layer_scale),
-+        triangular(triangular), recompute(recompute),
-+        local_attention(local_attention), window_size(window_size),
-+        total_count(total_count), heads(heads),
-+        sequence_length(sequence_length), num_seq(num_seq),
-+        head_offset(head_offset), mask_stride(mask_stride), mp_size(mp_size),
-+        reduceWidth(reduceWidth){};
-+
-+  void operator()
-+      [[sycl::reqd_sub_group_size(WARP_SIZE)]] (sycl::nd_item<1> pos) const {
-+    auto b = sycl::ext::oneapi::experimental::this_group<1>();
-+    auto g = sycl::ext::oneapi::experimental::this_sub_group();
- 
-   float2 low_data[MAX_REG_SIZE];
-   float2 high_data[MAX_REG_SIZE];
-   const T zero_h = conversion::to<T>(0.f);
- 
--  int wid = threadIdx.x >> 5;
--  int lane = threadIdx.x & 0x1f;
--  int warp_num = blockDim.x >> 5;
-+    auto tid = pos.get_local_id(0);
-+    int wid = tid >> 5;
-+    int lane = tid & 0x1f;
-+    int warp_num = pos.get_local_range(0) >> 5;
- 
-   int reduce_blocks = reduceWidth >> 5;
--  int seq_lane = threadIdx.x % reduceWidth;
-+    int seq_lane = tid % reduceWidth;
- 
--  __shared__ float partialSum[MAX_WARP_NUM];
-+    local_ptr<float> partialSum = __group_local_memory<float[MAX_WARP_NUM]>(b);
- 
-   int iter_offset =
--      blockIdx.x * (warp_num / reduce_blocks) + (wid / reduce_blocks);
-+        pos.get_group(0) * (warp_num / reduce_blocks) + (wid / reduce_blocks);
-   int batch_idx = iter_offset / (num_seq * heads);
-   int alibi_offset = batch_idx * heads * mp_size + head_offset;
-   int mask_offset = batch_idx * mask_stride + (iter_offset % mask_stride);
- 
-+    T *rvals = vals;
-+
-   if (iter_offset < total_count) {
--    vals += (iter_offset * sequence_length);
-+      rvals += (iter_offset * sequence_length);
- 
-     alibi_offset =
-         (alibi_offset + ((iter_offset / num_seq) % heads)) * sequence_length;
-     mask_offset = mask_offset * sequence_length;
-     int seq_id = iter_offset % num_seq;
-+      int seq_id4 = seq_id >> 2;
- 
-     int real_seq_id =
-         seq_id + (num_seq == sequence_length ? 0 : sequence_length);
-@@ -69,237 +105,247 @@
-                             : -1;
- 
-     float max_val = minus_infinity;
--    // if (lane == 0) printf("%d, %d: %d \n", wid, blockIdx.x, mask_offset);
-     for (int i = 0; i < iterations; i++) {
--      int data_id = i * (reduceWidth << 2) + (seq_lane);
--      bool check = (data_id >> 2) >= window_stride4;
--      bool low_x_check = check && (data_id < sequence_length) &&
--                         (!triangular || (data_id <= seq_id)) &&
--                         (data_id > window_stride);
--      bool low_y_check = check && ((data_id + reduceWidth) < sequence_length) &&
--                         (!triangular || ((data_id + reduceWidth) <= seq_id)) &&
--                         ((data_id + reduceWidth) > window_stride);
--      bool high_x_check =
--          check && ((data_id + reduceWidth * 2) < sequence_length) &&
--          (!triangular || ((data_id + reduceWidth * 2) <= seq_id)) &&
--          ((data_id + reduceWidth * 2) > window_stride);
--      bool high_y_check =
--          check && ((data_id + reduceWidth * 3) < sequence_length) &&
--          (!triangular || ((data_id + reduceWidth * 3) <= seq_id)) &&
--          ((data_id + reduceWidth * 3) > window_stride);
--
--      if (mask && alibi) {
--        low_data[i].x =
--            low_x_check
--                ? conversion::to<float>(vals[data_id]) * layer_scale +
--                      (conversion::to<float>(alibi[data_id + alibi_offset])) +
--                      (conversion::to<float>(mask[data_id + mask_offset]))
--                : minus_infinity;
--        low_data[i].y =
--            low_y_check
--                ? conversion::to<float>(vals[data_id + reduceWidth]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          alibi[data_id + alibi_offset + reduceWidth])) +
--                      (conversion::to<float>(
--                          mask[data_id + mask_offset + reduceWidth]))
--                : minus_infinity;
--        high_data[i].x =
--            high_x_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 2]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          alibi[data_id + alibi_offset + reduceWidth * 2])) +
--                      (conversion::to<float>(
--                          mask[data_id + mask_offset + reduceWidth * 2]))
--                : minus_infinity;
--        high_data[i].y =
--            high_y_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 3]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          alibi[data_id + alibi_offset + reduceWidth * 3])) +
--                      (conversion::to<float>(
--                          mask[data_id + mask_offset + reduceWidth * 3]))
--                : minus_infinity;
--      } else if (mask) {
--        low_data[i].x =
--            low_x_check
--                ? conversion::to<float>(vals[data_id]) * layer_scale +
--                      (conversion::to<float>(mask[data_id + mask_offset]))
--                : minus_infinity;
--        low_data[i].y =
--            low_y_check ? conversion::to<float>(vals[data_id + reduceWidth]) *
--                                  layer_scale +
--                              (conversion::to<float>(
--                                  mask[data_id + mask_offset + reduceWidth]))
--                        : minus_infinity;
--        high_data[i].x =
--            high_x_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 2]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          mask[data_id + mask_offset + reduceWidth * 2]))
--                : minus_infinity;
--        high_data[i].y =
--            high_y_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 3]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          mask[data_id + mask_offset + reduceWidth * 3]))
--                : minus_infinity;
--      } else if (alibi) {
--        low_data[i].x =
--            low_x_check
--                ? conversion::to<float>(vals[data_id]) * layer_scale +
--                      (conversion::to<float>(alibi[data_id + alibi_offset]))
--                : minus_infinity;
--        low_data[i].y =
--            low_y_check ? conversion::to<float>(vals[data_id + reduceWidth]) *
--                                  layer_scale +
--                              (conversion::to<float>(
--                                  alibi[data_id + alibi_offset + reduceWidth]))
--                        : minus_infinity;
--        high_data[i].x =
--            high_x_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 2]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          alibi[data_id + alibi_offset + reduceWidth * 2]))
--                : minus_infinity;
--        high_data[i].y =
--            high_y_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 3]) *
--                          layer_scale +
--                      (conversion::to<float>(
--                          alibi[data_id + alibi_offset + reduceWidth * 3]))
--                : minus_infinity;
-+        int data_id = i * (reduceWidth << 2) + (seq_lane << 2);
-+        if ((!triangular || ((data_id >> 2) <= seq_id4)) &&
-+            (data_id >> 2) >= window_stride4 && data_id < sequence_length) {
-+          if ((sequence_length - data_id) >= 4) {
-+            low_data[i].x() =
-+                data_id > window_stride
-+                    ? conversion::to<float>(rvals[data_id]) * layer_scale
-+                    : minus_infinity;
-+            low_data[i].y() =
-+                ((!triangular || ((data_id + 1) <= seq_id)) &&
-+                 (data_id + 1) > window_stride)
-+                    ? conversion::to<float>(rvals[data_id + 1]) * layer_scale
-+                    : minus_infinity;
-+            high_data[i].x() =
-+                ((!triangular || ((data_id + 2) <= seq_id)) &&
-+                 (data_id + 2) > window_stride)
-+                    ? conversion::to<float>(rvals[data_id + 2]) * layer_scale
-+                    : minus_infinity;
-+            high_data[i].y() =
-+                ((!triangular || ((data_id + 3) <= seq_id)) &&
-+                 (data_id + 3) > window_stride)
-+                    ? conversion::to<float>(rvals[data_id + 3]) * layer_scale
-+                    : minus_infinity;
-+            if (alibi) {
-+              low_data[i].x() =
-+                  low_data[i].x() +
-+                  conversion::to<float>(alibi[data_id + alibi_offset]);
-+              low_data[i].y() =
-+                  low_data[i].y() +
-+                  conversion::to<float>(alibi[data_id + alibi_offset + 1]);
-+              high_data[i].x() =
-+                  high_data[i].x() +
-+                  conversion::to<float>(alibi[data_id + alibi_offset + 2]);
-+              high_data[i].y() =
-+                  high_data[i].y() +
-+                  conversion::to<float>(alibi[data_id + alibi_offset + 3]);
-+            }
-+            if (mask) {
-+              low_data[i].x() +=
-+                  conversion::to<float>(mask[data_id + mask_offset]);
-+              low_data[i].y() +=
-+                  conversion::to<float>(mask[data_id + mask_offset + 1]);
-+              high_data[i].x() +=
-+                  conversion::to<float>(mask[data_id + mask_offset + 2]);
-+              high_data[i].y() +=
-+                  conversion::to<float>(mask[data_id + mask_offset + 3]);
-+            }
-       } else {
--        low_data[i].x = low_x_check
--                            ? conversion::to<float>(vals[data_id]) * layer_scale
--                            : minus_infinity;
--        low_data[i].y =
--            low_y_check ? conversion::to<float>(vals[data_id + reduceWidth]) *
--                              layer_scale
--                        : minus_infinity;
--        high_data[i].x =
--            high_x_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 2]) *
--                      layer_scale
--                : minus_infinity;
--        high_data[i].y =
--            high_y_check
--                ? conversion::to<float>(vals[data_id + reduceWidth * 3]) *
--                      layer_scale
--                : minus_infinity;
-+            low_data[i].x() =
-+                data_id > window_stride
-+                    ? conversion::to<float>(rvals[data_id]) * layer_scale
-+                    : minus_infinity;
-+            low_data[i].y() =
-+                (((!triangular || (data_id + 1) <= seq_id) &&
-+                  (data_id + 1) > window_stride) &&
-+                 (data_id + 1) < sequence_length)
-+                    ? conversion::to<float>(rvals[data_id + 1]) * layer_scale
-+                    : minus_infinity;
-+            high_data[i].x() =
-+                (((!triangular || (data_id + 2) <= seq_id) &&
-+                  (data_id + 2) > window_stride) &&
-+                 (data_id + 2) < sequence_length)
-+                    ? conversion::to<float>(rvals[data_id + 2]) * layer_scale
-+                    : minus_infinity;
-+            if (alibi) {
-+              low_data[i].x() =
-+                  low_data[i].x() +
-+                  conversion::to<float>(alibi[data_id + alibi_offset]);
-+              if ((data_id + 1) < sequence_length)
-+                low_data[i].y() =
-+                    low_data[i].y() +
-+                    conversion::to<float>(alibi[data_id + alibi_offset + 1]);
-+              if ((data_id + 2) < sequence_length)
-+                high_data[i].x() =
-+                    high_data[i].x() +
-+                    conversion::to<float>(alibi[data_id + alibi_offset + 2]);
-+            }
-+            high_data[i].y() = minus_infinity;
-+            if (mask) {
-+              low_data[i].x() +=
-+                  conversion::to<float>(mask[data_id + mask_offset]);
-+              if ((data_id + 1) < sequence_length)
-+                low_data[i].y() +=
-+                    conversion::to<float>(mask[data_id + mask_offset + 1]);
-+              if ((data_id + 2) < sequence_length)
-+                high_data[i].x() +=
-+                    conversion::to<float>(mask[data_id + mask_offset + 2]);
-+            }
-+          }
-+          max_val = (low_data[i].x() > max_val ? low_data[i].x() : max_val);
-+          max_val = (low_data[i].y() > max_val ? low_data[i].y() : max_val);
-+          max_val = (high_data[i].x() > max_val ? high_data[i].x() : max_val);
-+          max_val = (high_data[i].y() > max_val ? high_data[i].y() : max_val);
-+        } else {
-+          low_data[i].x() = minus_infinity;
-+          low_data[i].y() = minus_infinity;
-+          high_data[i].x() = minus_infinity;
-+          high_data[i].y() = minus_infinity;
-       }
--
--      // if(lane == 0) printf("%f , %d, %d \n", low_data[i].x, data_id, seq_id);
--      max_val = (low_data[i].x > max_val ? low_data[i].x : max_val);
--      max_val = (low_data[i].y > max_val ? low_data[i].y : max_val);
--      max_val = (high_data[i].x > max_val ? high_data[i].x : max_val);
--      max_val = (high_data[i].y > max_val ? high_data[i].y : max_val);
-     }
- 
-     for (int i = 1; i < WARP_SIZE; i *= 2) {
--      auto temp = g.shfl_xor(max_val, i);
-+        auto temp = g.shuffle_xor(max_val, i);
-       max_val = (temp > max_val ? temp : max_val);
-     }
- 
-     if (reduceWidth > WARP_SIZE) {
-       if (lane == 0)
-         partialSum[wid] = max_val;
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       if (lane < warp_num)
-         max_val = partialSum[lane];
- 
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       for (int i = 1; i < reduce_blocks; i *= 2) {
--        auto temp = g.shfl_xor(max_val, i);
-+          auto temp = g.shuffle_xor(max_val, i);
-         max_val = (temp > max_val ? temp : max_val);
-       }
- 
--      max_val = g.shfl(max_val, threadIdx.x / WARP_SIZE);
-+        max_val = g.shuffle(max_val, tid / WARP_SIZE);
-     }
-     float sum = 0;
-     for (int i = 0; i < iterations; i++) {
--      low_data[i].x = __expf(low_data[i].x - max_val);
--      low_data[i].y = __expf(low_data[i].y - max_val);
--      high_data[i].x = __expf(high_data[i].x - max_val);
--      high_data[i].y = __expf(high_data[i].y - max_val);
-+        low_data[i].x() = sycl::exp(low_data[i].x() - max_val);
-+        low_data[i].y() = sycl::exp(low_data[i].y() - max_val);
-+        high_data[i].x() = sycl::exp(high_data[i].x() - max_val);
-+        high_data[i].y() = sycl::exp(high_data[i].y() - max_val);
- 
--      sum += (low_data[i].x + low_data[i].y + high_data[i].x + high_data[i].y);
-+        sum += (low_data[i].x() + low_data[i].y() + high_data[i].x() +
-+                high_data[i].y());
-     }
- 
-     for (int i = 1; i < WARP_SIZE; i *= 2)
--      sum += g.shfl_xor(sum, i);
-+        sum += g.shuffle_xor(sum, i);
- 
-     if (reduceWidth > WARP_SIZE) {
-       if (lane == 0)
-         partialSum[wid] = sum;
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       if (lane < warp_num)
-         sum = partialSum[lane];
- 
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       for (int i = 1; i < reduce_blocks; i *= 2) {
--        sum += g.shfl_xor(sum, i);
-+          sum += g.shuffle_xor(sum, i);
-       }
- 
--      sum = g.shfl(sum, threadIdx.x / WARP_SIZE);
-+        sum = g.shuffle(sum, tid / WARP_SIZE);
-     }
-     sum += 1e-6;
-     for (int i = 0; i < iterations; i++) {
--      int data_id = i * (reduceWidth << 2) + (seq_lane);
-+        int data_id = i * (reduceWidth << 2) + (seq_lane << 2);
-+
-       if (data_id < sequence_length) {
--        vals[data_id] = conversion::to<T>(low_data[i].x / sum);
--        if ((data_id + reduceWidth) < sequence_length)
--          vals[data_id + reduceWidth] = conversion::to<T>(low_data[i].y / sum);
--        if ((data_id + reduceWidth * 2) < sequence_length)
--          vals[data_id + reduceWidth * 2] =
--              conversion::to<T>(high_data[i].x / sum);
--        if ((data_id + reduceWidth * 3) < sequence_length)
--          vals[data_id + reduceWidth * 3] =
--              conversion::to<T>(high_data[i].y / sum);
-+          if ((sequence_length - data_id) >= 4) {
-+            rvals[data_id] = conversion::to<T>(low_data[i].x() / sum);
-+            rvals[data_id + 1] = conversion::to<T>(low_data[i].y() / sum);
-+            rvals[data_id + 2] = conversion::to<T>(high_data[i].x() / sum);
-+            rvals[data_id + 3] = conversion::to<T>(high_data[i].y() / sum);
-+          } else {
-+            rvals[data_id] = conversion::to<T>(low_data[i].x() / sum);
-+            if ((data_id + 1) < sequence_length)
-+              rvals[data_id + 1] = conversion::to<T>(low_data[i].y() / sum);
-+            if ((data_id + 2) < sequence_length)
-+              rvals[data_id + 2] = conversion::to<T>(high_data[i].x() / sum);
-       }
-     }
-   }
- }
--
--template <int iterations>
--__global__ void
--attn_softmax_v2(float *vals, float *attn_mask, float *alibi, float layer_scale,
--                bool triangular, bool recompute, bool local_attention,
--                int window_size, int total_count, int heads,
--                int sequence_length, int num_seq, int head_offset,
--                int mask_stride, int mp_size, int reduceWidth) {
--  cg::thread_block b = cg::this_thread_block();
--  cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
-+  };
-+};
-+
-+template <int iterations> class attn_softmax_v2<float, iterations> {
-+private:
-+  float *vals;
-+  float *attn_mask;
-+  float *alibi;
-+  float layer_scale;
-+  bool triangular;
-+  bool recompute;
-+  bool local_attention;
-+  int window_size;
-+  int total_count;
-+  int heads;
-+  int sequence_length;
-+  int num_seq;
-+  int head_offset;
-+  int mask_stride;
-+  int mp_size;
-+  int reduceWidth;
++    T* vals;
++    T* mask;
++    T* alibi;
++    float layer_scale;
++    bool triangular;
++    bool recompute;
++    bool local_attention;
++    int window_size;
++    int total_count;
++    int heads;
++    int sequence_length;
++    int num_seq;
++    int head_offset;
++    int mask_stride;
++    int mp_size;
++    int reduceWidth;
 +
 +public:
-+  attn_softmax_v2(float *vals, float *attn_mask, float *alibi,
-+                  float layer_scale, bool triangular, bool recompute,
-+                  bool local_attention, int window_size, int total_count,
-+                  int heads, int sequence_length, int num_seq, int head_offset,
-+                  int mask_stride, int mp_size, int reduceWidth)
-+      : vals(vals), attn_mask(attn_mask), alibi(alibi),
-+        layer_scale(layer_scale), triangular(triangular), recompute(recompute),
-+        local_attention(local_attention), window_size(window_size),
-+        total_count(total_count), heads(heads),
-+        sequence_length(sequence_length), num_seq(num_seq),
-+        head_offset(head_offset), mask_stride(mask_stride), mp_size(mp_size),
-+        reduceWidth(reduceWidth){};
++    attn_softmax_v2(T* vals,
+                                 T* mask,
+                                 T* alibi,
+                                 float layer_scale,
+@@ -48,30 +63,51 @@
+                                 int mask_stride,
+                                 int mp_size,
+                                 int reduceWidth)
++        : vals(vals),
++          mask(mask),
++          alibi(alibi),
++          layer_scale(layer_scale),
++          triangular(triangular),
++          recompute(recompute),
++          local_attention(local_attention),
++          window_size(window_size),
++          total_count(total_count),
++          heads(heads),
++          sequence_length(sequence_length),
++          num_seq(num_seq),
++          head_offset(head_offset),
++          mask_stride(mask_stride),
++          mp_size(mp_size),
++          reduceWidth(reduceWidth){};
 +
-+  void operator()
-+      [[sycl::reqd_sub_group_size(WARP_SIZE)]] (sycl::nd_item<1> pos) const {
-+    auto b = sycl::ext::oneapi::experimental::this_group<1>();
-+    auto g = sycl::ext::oneapi::experimental::this_sub_group();
++    void operator() [[sycl::reqd_sub_group_size(WARP_SIZE)]] (sycl::nd_item<1> pos) const
+ {
+-    cg::thread_block b = cg::this_thread_block();
+-    cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
++        auto b = sycl::ext::oneapi::experimental::this_group<1>();
++        auto g = sycl::ext::oneapi::experimental::this_sub_group();
  
-   float4 data[MAX_REG_SIZE];
+     float2 low_data[MAX_REG_SIZE];
+     float2 high_data[MAX_REG_SIZE];
+     const T zero_h = conversion::to<T>(0.f);
  
--  int wid = threadIdx.x >> 5;
--  int lane = threadIdx.x & 0x1f;
--  int warp_num = blockDim.x >> 5;
-+    auto tid = pos.get_local_id(0);
-+    int wid = tid >> 5;
-+    int lane = tid & 0x1f;
-+    int warp_num = pos.get_local_range(0) >> 5;
+-    int wid = threadIdx.x >> 5;
+-    int lane = threadIdx.x & 0x1f;
+-    int warp_num = blockDim.x >> 5;
++        auto tid = pos.get_local_id(0);
++        int wid = tid >> 5;
++        int lane = tid & 0x1f;
++        int warp_num = pos.get_local_range(0) >> 5;
  
-   int reduce_blocks = reduceWidth >> 5;
--  int seq_lane = threadIdx.x % reduceWidth;
-+    int seq_lane = tid % reduceWidth;
+     int reduce_blocks = reduceWidth >> 5;
+-    int seq_lane = threadIdx.x % reduceWidth;
++        int seq_lane = tid % reduceWidth;
  
--  __shared__ float partialSum[MAX_WARP_NUM];
-+    auto partialSum = local_ptr<float>(local_ptr<void>(
-+        sycl::ext::oneapi::group_local_memory<float[MAX_WARP_NUM]>(b).get()));
+-    __shared__ float partialSum[MAX_WARP_NUM];
++        local_ptr<float> partialSum = __group_local_memory<float[MAX_WARP_NUM]>(b);
  
-   int iter_offset =
--      blockIdx.x * (warp_num / reduce_blocks) + (wid / reduce_blocks);
-+        pos.get_group(0) * (warp_num / reduce_blocks) + (wid / reduce_blocks);
-+
-+    float *rvals = vals;
-   if (iter_offset < total_count) {
--    vals += (iter_offset * sequence_length);
-+      rvals += (iter_offset * sequence_length);
- 
+-    int iter_offset = blockIdx.x * (warp_num / reduce_blocks) + (wid / reduce_blocks);
++        int iter_offset = pos.get_group(0) * (warp_num / reduce_blocks) + (wid / reduce_blocks);
      int batch_idx = iter_offset / (num_seq * heads);
-+      int alibi_offset = batch_idx * heads * mp_size + head_offset;
+     int alibi_offset = batch_idx * heads * mp_size + head_offset;
      int mask_offset = batch_idx * mask_stride + (iter_offset % mask_stride);
-     mask_offset = mask_offset * sequence_length;
-     int seq_id = iter_offset % num_seq;
-+      int seq_id4 = seq_id >> 2;
  
-     int real_seq_id =
-         seq_id + (num_seq == sequence_length ? 0 : sequence_length);
-@@ -314,122 +360,148 @@
-     float max_val = minus_infinity;
- 
-     for (int i = 0; i < iterations; i++) {
--      int data_id = i * (reduceWidth << 2) + (seq_lane);
--      bool check = (data_id >> 2) >= window_stride4;
--      bool x_check = check && (data_id < sequence_length) &&
--                     (!triangular || (data_id <= seq_id)) &&
--                     (data_id > window_stride);
--      bool y_check = check && ((data_id + reduceWidth) < sequence_length) &&
--                     (!triangular || ((data_id + reduceWidth) <= seq_id)) &&
--                     ((data_id + reduceWidth) > window_stride);
--      bool z_check = check && ((data_id + reduceWidth * 2) < sequence_length) &&
--                     (!triangular || ((data_id + reduceWidth * 2) <= seq_id)) &&
--                     ((data_id + reduceWidth * 2) > window_stride);
--      bool w_check = check && ((data_id + reduceWidth * 3) < sequence_length) &&
--                     (!triangular || ((data_id + reduceWidth * 3) <= seq_id)) &&
--                     ((data_id + reduceWidth * 3) > window_stride);
--
--      if (attn_mask) {
--        data[i].x = x_check ? vals[data_id] + attn_mask[data_id + mask_offset]
-+        int data_id = i * (reduceWidth << 2) + (seq_lane << 2);
-+        if ((!triangular || ((data_id >> 2) <= seq_id4)) &&
-+            (data_id >> 2) >= window_stride4 && data_id < sequence_length) {
-+          if ((sequence_length - data_id) >= 4) {
-+            data[i].x() =
-+                (data_id > window_stride ? rvals[data_id] : minus_infinity);
-+            data[i].y() = ((!triangular || ((data_id + 1) <= seq_id)) &&
-+                           (data_id + 1) > window_stride)
-+                              ? rvals[data_id + 1]
-+                              : minus_infinity;
-+            data[i].z() = ((!triangular || ((data_id + 2) <= seq_id)) &&
-+                           (data_id + 2) > window_stride)
-+                              ? rvals[data_id + 2]
-+                              : minus_infinity;
-+            data[i].w() = ((!triangular || ((data_id + 3) <= seq_id)) &&
-+                           (data_id + 3) > window_stride)
-+                              ? rvals[data_id + 3]
-                             : minus_infinity;
--        data[i].y = y_check ? vals[data_id + reduceWidth] +
--                                  attn_mask[data_id + mask_offset + reduceWidth]
--                            : minus_infinity;
--        data[i].z = z_check
--                        ? vals[data_id + reduceWidth * 2] +
--                              attn_mask[data_id + mask_offset + reduceWidth * 2]
--                        : minus_infinity;
--        data[i].w = w_check
--                        ? vals[data_id + reduceWidth * 3] +
--                              attn_mask[data_id + mask_offset + reduceWidth * 3]
-+            if (attn_mask) {
-+              data[i].x() += attn_mask[data_id + mask_offset];
-+              data[i].y() += attn_mask[data_id + mask_offset + 1];
-+              data[i].z() += attn_mask[data_id + mask_offset + 2];
-+              data[i].w() += attn_mask[data_id + mask_offset + 3];
-+            }
-+          } else {
-+            data[i].x() =
-+                data_id > window_stride ? rvals[data_id] : minus_infinity;
-+            data[i].y() = (((!triangular || (data_id + 1) <= seq_id)) &&
-+                           (data_id + 1) > window_stride &&
-+                           (data_id + 1) < sequence_length)
-+                              ? (rvals[data_id + 1])
-+                              : minus_infinity;
-+            data[i].z() = (((!triangular || (data_id + 2) <= seq_id)) &&
-+                           (data_id + 2) > window_stride &&
-+                           (data_id + 2) < sequence_length)
-+                              ? (rvals[data_id + 2])
-                         : minus_infinity;
-+            data[i].w() = minus_infinity;
-+            if (attn_mask) {
-+              data[i].x() += attn_mask[data_id + mask_offset];
-+              if ((data_id + 1) < sequence_length)
-+                data[i].y() += attn_mask[data_id + mask_offset + 1];
-+              if ((data_id + 2) < sequence_length)
-+                data[i].z() += attn_mask[data_id + mask_offset + 2];
-+            }
-+          }
-+          max_val = (data[i].x() > max_val ? data[i].x() : max_val);
-+          max_val = (data[i].y() > max_val ? data[i].y() : max_val);
-+          max_val = (data[i].z() > max_val ? data[i].z() : max_val);
-+          max_val = (data[i].w() > max_val ? data[i].w() : max_val);
-       } else {
--        data[i].x = x_check ? vals[data_id] : minus_infinity;
--        data[i].y = y_check ? vals[data_id + reduceWidth] : minus_infinity;
--        data[i].z = z_check ? vals[data_id + reduceWidth * 2] : minus_infinity;
--        data[i].w = w_check ? vals[data_id + reduceWidth * 3] : minus_infinity;
-+          data[i].x() = minus_infinity;
-+          data[i].y() = minus_infinity;
-+          data[i].z() = minus_infinity;
-+          data[i].w() = minus_infinity;
-       }
--
--      max_val = (data[i].x > max_val ? data[i].x : max_val);
--      max_val = (data[i].y > max_val ? data[i].y : max_val);
--      max_val = (data[i].z > max_val ? data[i].z : max_val);
--      max_val = (data[i].w > max_val ? data[i].w : max_val);
-     }
- 
-     for (int i = 1; i < WARP_SIZE; i *= 2) {
--      auto temp = g.shfl_xor(max_val, i);
-+        auto temp = g.shuffle_xor(max_val, i);
-       max_val = (temp > max_val ? temp : max_val);
-     }
- 
-     if (reduceWidth > WARP_SIZE) {
-       if (lane == 0)
-         partialSum[wid] = max_val;
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       if (lane < warp_num)
-         max_val = partialSum[lane];
- 
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       for (int i = 1; i < reduce_blocks; i *= 2) {
--        auto temp = g.shfl_xor(max_val, i);
-+          auto temp = g.shuffle_xor(max_val, i);
-         max_val = (temp > max_val ? temp : max_val);
-       }
- 
--      max_val = g.shfl(max_val, threadIdx.x / WARP_SIZE);
-+        max_val = g.shuffle(max_val, tid / WARP_SIZE);
-     }
- 
-     float sum = 0;
-     for (int i = 0; i < iterations; i++) {
--      data[i].x = __expf(data[i].x - max_val);
--      data[i].y = __expf(data[i].y - max_val);
--      data[i].z = __expf(data[i].z - max_val);
--      data[i].w = __expf(data[i].w - max_val);
-+        data[i].x() = sycl::exp(data[i].x() - max_val);
-+        data[i].y() = sycl::exp(data[i].y() - max_val);
-+        data[i].z() = sycl::exp(data[i].z() - max_val);
-+        data[i].w() = sycl::exp(data[i].w() - max_val);
- 
--      sum += (data[i].x + data[i].y + data[i].z + data[i].w);
-+        sum += (data[i].x() + data[i].y() + data[i].z() + data[i].w());
-     }
- 
-     for (int i = 1; i < WARP_SIZE; i *= 2)
--      sum += g.shfl_xor(sum, i);
-+        sum += g.shuffle_xor(sum, i);
- 
-     if (reduceWidth > WARP_SIZE) {
-       if (lane == 0)
-         partialSum[wid] = sum;
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       if (lane < warp_num)
-         sum = partialSum[lane];
- 
--      b.sync();
-+        sycl::group_barrier(b, b.fence_scope);
- 
-       for (int i = 1; i < reduce_blocks; i *= 2) {
--        sum += g.shfl_xor(sum, i);
-+          sum += g.shuffle_xor(sum, i);
-       }
- 
--      sum = g.shfl(sum, threadIdx.x / WARP_SIZE);
-+        sum = g.shuffle(sum, tid / WARP_SIZE);
-     }
-     sum += 1e-6;
- 
-     for (int i = 0; i < iterations; i++) {
--      int data_id = i * (reduceWidth << 2) + (seq_lane);
-+        int data_id = i * (reduceWidth << 2) + (seq_lane << 2);
++        T* rvals = vals;
 +
-       if (data_id < sequence_length) {
--        vals[data_id] = data[i].x / sum;
--        if ((data_id + reduceWidth) < sequence_length)
--          vals[data_id + reduceWidth] = data[i].y / sum;
--        if ((data_id + reduceWidth * 2) < sequence_length)
--          vals[data_id + reduceWidth * 2] = data[i].z / sum;
--        if ((data_id + reduceWidth * 3) < sequence_length)
--          vals[data_id + reduceWidth * 3] = data[i].w / sum;
-+          if ((sequence_length - data_id) >= 4) {
-+            rvals[data_id] = data[i].x() / sum;
-+            rvals[data_id + 1] = data[i].y() / sum;
-+            rvals[data_id + 2] = data[i].z() / sum;
-+            rvals[data_id + 3] = data[i].w() / sum;
-+          } else {
-+            rvals[data_id] = data[i].x() / sum;
-+            if ((data_id + 1) < sequence_length)
-+              rvals[data_id + 1] = data[i].y() / sum;
-+            if ((data_id + 2) < sequence_length)
-+              rvals[data_id + 2] = data[i].z() / sum;
-       }
+     if (iter_offset < total_count) {
+-        vals += (iter_offset * sequence_length);
++            rvals += (iter_offset * sequence_length);
+ 
+         alibi_offset = (alibi_offset + ((iter_offset / num_seq) % heads)) * sequence_length;
+         mask_offset = mask_offset * sequence_length;
+@@ -102,158 +138,179 @@
+                                 ((data_id + reduceWidth * 3) > window_stride);
+ 
+             if (mask && alibi) {
+-                low_data[i].x = low_x_check
+-                                    ? conversion::to<float>(vals[data_id]) * layer_scale +
++                    low_data[i].x() = low_x_check
++                                        ? conversion::to<float>(rvals[data_id]) * layer_scale +
+                                           (conversion::to<float>(alibi[data_id + alibi_offset])) +
+                                           (conversion::to<float>(mask[data_id + mask_offset]))
+                                     : minus_infinity;
+-                low_data[i].y =
++                    low_data[i].y() =
+                     low_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth]) * layer_scale +
+                               (conversion::to<float>(alibi[data_id + alibi_offset + reduceWidth])) +
+                               (conversion::to<float>(mask[data_id + mask_offset + reduceWidth]))
+                         : minus_infinity;
+-                high_data[i].x =
++                    high_data[i].x() =
+                     high_x_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 2]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 2]) * layer_scale +
+                               (conversion::to<float>(
+                                   alibi[data_id + alibi_offset + reduceWidth * 2])) +
+                               (conversion::to<float>(mask[data_id + mask_offset + reduceWidth * 2]))
+                         : minus_infinity;
+-                high_data[i].y =
++                    high_data[i].y() =
+                     high_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 3]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 3]) * layer_scale +
+                               (conversion::to<float>(
+                                   alibi[data_id + alibi_offset + reduceWidth * 3])) +
+                               (conversion::to<float>(mask[data_id + mask_offset + reduceWidth * 3]))
+                         : minus_infinity;
+             } else if (mask) {
+-                low_data[i].x = low_x_check
+-                                    ? conversion::to<float>(vals[data_id]) * layer_scale +
++                    low_data[i].x() = low_x_check
++                                        ? conversion::to<float>(rvals[data_id]) * layer_scale +
+                                           (conversion::to<float>(mask[data_id + mask_offset]))
+                                     : minus_infinity;
+-                low_data[i].y =
++                    low_data[i].y() =
+                     low_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth]) * layer_scale +
+                               (conversion::to<float>(mask[data_id + mask_offset + reduceWidth]))
+                         : minus_infinity;
+-                high_data[i].x =
++                    high_data[i].x() =
+                     high_x_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 2]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 2]) * layer_scale +
+                               (conversion::to<float>(mask[data_id + mask_offset + reduceWidth * 2]))
+                         : minus_infinity;
+-                high_data[i].y =
++                    high_data[i].y() =
+                     high_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 3]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 3]) * layer_scale +
+                               (conversion::to<float>(mask[data_id + mask_offset + reduceWidth * 3]))
+                         : minus_infinity;
+             } else if (alibi) {
+-                low_data[i].x = low_x_check
+-                                    ? conversion::to<float>(vals[data_id]) * layer_scale +
++                    low_data[i].x() = low_x_check
++                                        ? conversion::to<float>(rvals[data_id]) * layer_scale +
+                                           (conversion::to<float>(alibi[data_id + alibi_offset]))
+                                     : minus_infinity;
+-                low_data[i].y =
++                    low_data[i].y() =
+                     low_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth]) * layer_scale +
+                               (conversion::to<float>(alibi[data_id + alibi_offset + reduceWidth]))
+                         : minus_infinity;
+-                high_data[i].x =
++                    high_data[i].x() =
+                     high_x_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 2]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 2]) * layer_scale +
+                               (conversion::to<float>(
+                                   alibi[data_id + alibi_offset + reduceWidth * 2]))
+                         : minus_infinity;
+-                high_data[i].y =
++                    high_data[i].y() =
+                     high_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 3]) * layer_scale +
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 3]) * layer_scale +
+                               (conversion::to<float>(
+                                   alibi[data_id + alibi_offset + reduceWidth * 3]))
+                         : minus_infinity;
+             } else {
+-                low_data[i].x = low_x_check ? conversion::to<float>(vals[data_id]) * layer_scale
++                    low_data[i].x() = low_x_check ? conversion::to<float>(rvals[data_id]) * layer_scale
+                                             : minus_infinity;
+-                low_data[i].y =
+-                    low_y_check ? conversion::to<float>(vals[data_id + reduceWidth]) * layer_scale
++                    low_data[i].y() =
++                        low_y_check ? conversion::to<float>(rvals[data_id + reduceWidth]) * layer_scale
+                                 : minus_infinity;
+-                high_data[i].x =
++                    high_data[i].x() =
+                     high_x_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 2]) * layer_scale
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 2]) * layer_scale
+                         : minus_infinity;
+-                high_data[i].y =
++                    high_data[i].y() =
+                     high_y_check
+-                        ? conversion::to<float>(vals[data_id + reduceWidth * 3]) * layer_scale
++                            ? conversion::to<float>(rvals[data_id + reduceWidth * 3]) * layer_scale
+                         : minus_infinity;
+             }
+ 
+             // if(lane == 0) printf("%f , %d, %d \n", low_data[i].x, data_id, seq_id);
+-            max_val = (low_data[i].x > max_val ? low_data[i].x : max_val);
+-            max_val = (low_data[i].y > max_val ? low_data[i].y : max_val);
+-            max_val = (high_data[i].x > max_val ? high_data[i].x : max_val);
+-            max_val = (high_data[i].y > max_val ? high_data[i].y : max_val);
++                max_val = (low_data[i].x() > max_val ? low_data[i].x() : max_val);
++                max_val = (low_data[i].y() > max_val ? low_data[i].y() : max_val);
++                max_val = (high_data[i].x() > max_val ? high_data[i].x() : max_val);
++                max_val = (high_data[i].y() > max_val ? high_data[i].y() : max_val);
+         }
+ 
+         for (int i = 1; i < WARP_SIZE; i *= 2) {
+-            auto temp = g.shfl_xor(max_val, i);
++                auto temp = g.shuffle_xor(max_val, i);
+             max_val = (temp > max_val ? temp : max_val);
+         }
+ 
+         if (reduceWidth > WARP_SIZE) {
+             if (lane == 0) partialSum[wid] = max_val;
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+             if (lane < warp_num) max_val = partialSum[lane];
+ 
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+             for (int i = 1; i < reduce_blocks; i *= 2) {
+-                auto temp = g.shfl_xor(max_val, i);
++                    auto temp = g.shuffle_xor(max_val, i);
+                 max_val = (temp > max_val ? temp : max_val);
+             }
+ 
+-            max_val = g.shfl(max_val, threadIdx.x / WARP_SIZE);
++                max_val = g.shuffle(max_val, tid / WARP_SIZE);
+         }
+         float sum = 0;
+         for (int i = 0; i < iterations; i++) {
+-            low_data[i].x = __expf(low_data[i].x - max_val);
+-            low_data[i].y = __expf(low_data[i].y - max_val);
+-            high_data[i].x = __expf(high_data[i].x - max_val);
+-            high_data[i].y = __expf(high_data[i].y - max_val);
++                low_data[i].x() = sycl::exp(low_data[i].x() - max_val);
++                low_data[i].y() = sycl::exp(low_data[i].y() - max_val);
++                high_data[i].x() = sycl::exp(high_data[i].x() - max_val);
++                high_data[i].y() = sycl::exp(high_data[i].y() - max_val);
+ 
+-            sum += (low_data[i].x + low_data[i].y + high_data[i].x + high_data[i].y);
++                sum += (low_data[i].x() + low_data[i].y() + high_data[i].x() + high_data[i].y());
+         }
+ 
+-        for (int i = 1; i < WARP_SIZE; i *= 2) sum += g.shfl_xor(sum, i);
++            for (int i = 1; i < WARP_SIZE; i *= 2) sum += g.shuffle_xor(sum, i);
+ 
+         if (reduceWidth > WARP_SIZE) {
+             if (lane == 0) partialSum[wid] = sum;
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+             if (lane < warp_num) sum = partialSum[lane];
+ 
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+-            for (int i = 1; i < reduce_blocks; i *= 2) { sum += g.shfl_xor(sum, i); }
++                for (int i = 1; i < reduce_blocks; i *= 2) { sum += g.shuffle_xor(sum, i); }
+ 
+-            sum = g.shfl(sum, threadIdx.x / WARP_SIZE);
++                sum = g.shuffle(sum, tid / WARP_SIZE);
+         }
+         sum += 1e-6;
+         for (int i = 0; i < iterations; i++) {
+             int data_id = i * (reduceWidth << 2) + (seq_lane);
+             if (data_id < sequence_length) {
+-                vals[data_id] = conversion::to<T>(low_data[i].x / sum);
++                rvals[data_id] = conversion::to<T>(low_data[i].x() / sum);
+                 if ((data_id + reduceWidth) < sequence_length)
+-                    vals[data_id + reduceWidth] = conversion::to<T>(low_data[i].y / sum);
++                    rvals[data_id + reduceWidth] = conversion::to<T>(low_data[i].y() / sum);
+                 if ((data_id + reduceWidth * 2) < sequence_length)
+-                    vals[data_id + reduceWidth * 2] = conversion::to<T>(high_data[i].x / sum);
++                    rvals[data_id + reduceWidth * 2] = conversion::to<T>(high_data[i].x() / sum);
+                 if ((data_id + reduceWidth * 3) < sequence_length)
+-                    vals[data_id + reduceWidth * 3] = conversion::to<T>(high_data[i].y / sum);
+-            }
++                    rvals[data_id + reduceWidth * 3] = conversion::to<T>(high_data[i].y() / sum);
+         }
      }
-   }
  }
-+  };
++    };
 +};
  
- #define LAUNCH_ATTN_SOFTMAX_V2(iterations)                                     \
--  attn_softmax_v2<T, iterations><<<grid, block, 0, stream>>>(                  \
-+  attn_softmax_v2<T, iterations> fn(                                           \
-       vals, mask, alibi, layer_scale, triangular, recompute, local_attention,  \
-       window_size, total_count, heads, sequence_length, num_seq, head_offset,  \
--      mask_stride, mp_size, reduce_width);
-+      mask_stride, mp_size, reduce_width);                                     \
-+  stream.submit([&](sycl::handler &cmd_list) {                                 \
-+    cmd_list.parallel_for(sycl::nd_range<1>{grid, block}, fn);                 \
-+  });
+ template <int iterations>
+-__global__ void attn_softmax_v2(float* vals,
++class attn_softmax_v2<float, iterations> {
++private:
++    float* vals;
++    float* attn_mask;
++    float* alibi;
++    float layer_scale;
++    bool triangular;
++    bool recompute;
++    bool local_attention;
++    int window_size;
++    int total_count;
++    int heads;
++    int sequence_length;
++    int num_seq;
++    int head_offset;
++    int mask_stride;
++    int mp_size;
++    int reduceWidth;
++
++public:
++    attn_softmax_v2(float* vals,
+                                 float* attn_mask,
+                                 float* alibi,
+                                 float layer_scale,
+@@ -269,26 +326,49 @@
+                                 int mask_stride,
+                                 int mp_size,
+                                 int reduceWidth)
++        : vals(vals),
++          attn_mask(attn_mask),
++          alibi(alibi),
++          layer_scale(layer_scale),
++          triangular(triangular),
++          recompute(recompute),
++          local_attention(local_attention),
++          window_size(window_size),
++          total_count(total_count),
++          heads(heads),
++          sequence_length(sequence_length),
++          num_seq(num_seq),
++          head_offset(head_offset),
++          mask_stride(mask_stride),
++          mp_size(mp_size),
++          reduceWidth(reduceWidth){};
++
++    void operator() [[sycl::reqd_sub_group_size(WARP_SIZE)]] (sycl::nd_item<1> pos) const
+ {
+-    cg::thread_block b = cg::this_thread_block();
+-    cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
++        auto b = sycl::ext::oneapi::experimental::this_group<1>();
++        auto g = sycl::ext::oneapi::experimental::this_sub_group();
+ 
+     float4 data[MAX_REG_SIZE];
+ 
+-    int wid = threadIdx.x >> 5;
+-    int lane = threadIdx.x & 0x1f;
+-    int warp_num = blockDim.x >> 5;
++        auto tid = pos.get_local_id(0);
++        int wid = tid >> 5;
++        int lane = tid & 0x1f;
++        int warp_num = pos.get_local_range(0) >> 5;
+ 
+     int reduce_blocks = reduceWidth >> 5;
+-    int seq_lane = threadIdx.x % reduceWidth;
++        int seq_lane = tid % reduceWidth;
++
++        auto partialSum = local_ptr<float>(
++            local_ptr<void>(sycl::ext::oneapi::group_local_memory<float[MAX_WARP_NUM]>(b).get()));
+ 
+-    __shared__ float partialSum[MAX_WARP_NUM];
++        int iter_offset = pos.get_group(0) * (warp_num / reduce_blocks) + (wid / reduce_blocks);
+ 
+-    int iter_offset = blockIdx.x * (warp_num / reduce_blocks) + (wid / reduce_blocks);
++        float* rvals = vals;
+     if (iter_offset < total_count) {
+-        vals += (iter_offset * sequence_length);
++            rvals += (iter_offset * sequence_length);
+ 
+         int batch_idx = iter_offset / (num_seq * heads);
++            int alibi_offset = batch_idx * heads * mp_size + head_offset;
+         int mask_offset = batch_idx * mask_stride + (iter_offset % mask_stride);
+         mask_offset = mask_offset * sequence_length;
+         int seq_id = iter_offset % num_seq;
+@@ -318,94 +398,95 @@
+                            ((data_id + reduceWidth * 3) > window_stride);
+ 
+             if (attn_mask) {
+-                data[i].x = x_check ? vals[data_id] + attn_mask[data_id + mask_offset]
++                    data[i].x() = x_check ? rvals[data_id] + attn_mask[data_id + mask_offset]
+                                     : minus_infinity;
+-                data[i].y = y_check ? vals[data_id + reduceWidth] +
++                    data[i].y() = y_check ? rvals[data_id + reduceWidth] +
+                                           attn_mask[data_id + mask_offset + reduceWidth]
+                                     : minus_infinity;
+-                data[i].z = z_check ? vals[data_id + reduceWidth * 2] +
++                    data[i].z() = z_check ? rvals[data_id + reduceWidth * 2] +
+                                           attn_mask[data_id + mask_offset + reduceWidth * 2]
+                                     : minus_infinity;
+-                data[i].w = w_check ? vals[data_id + reduceWidth * 3] +
++                    data[i].w() = w_check ? rvals[data_id + reduceWidth * 3] +
+                                           attn_mask[data_id + mask_offset + reduceWidth * 3]
+                                     : minus_infinity;
+             } else {
+-                data[i].x = x_check ? vals[data_id] : minus_infinity;
+-                data[i].y = y_check ? vals[data_id + reduceWidth] : minus_infinity;
+-                data[i].z = z_check ? vals[data_id + reduceWidth * 2] : minus_infinity;
+-                data[i].w = w_check ? vals[data_id + reduceWidth * 3] : minus_infinity;
++                    data[i].x() = x_check ? rvals[data_id] : minus_infinity;
++                    data[i].y() = y_check ? rvals[data_id + reduceWidth] : minus_infinity;
++                    data[i].z() = z_check ? rvals[data_id + reduceWidth * 2] : minus_infinity;
++                    data[i].w() = w_check ? rvals[data_id + reduceWidth * 3] : minus_infinity;
+             }
+ 
+-            max_val = (data[i].x > max_val ? data[i].x : max_val);
+-            max_val = (data[i].y > max_val ? data[i].y : max_val);
+-            max_val = (data[i].z > max_val ? data[i].z : max_val);
+-            max_val = (data[i].w > max_val ? data[i].w : max_val);
++                max_val = (data[i].x() > max_val ? data[i].x() : max_val);
++                max_val = (data[i].y() > max_val ? data[i].y() : max_val);
++                max_val = (data[i].z() > max_val ? data[i].z() : max_val);
++                max_val = (data[i].w() > max_val ? data[i].w() : max_val);
+         }
+ 
+         for (int i = 1; i < WARP_SIZE; i *= 2) {
+-            auto temp = g.shfl_xor(max_val, i);
++                auto temp = g.shuffle_xor(max_val, i);
+             max_val = (temp > max_val ? temp : max_val);
+         }
+ 
+         if (reduceWidth > WARP_SIZE) {
+             if (lane == 0) partialSum[wid] = max_val;
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+             if (lane < warp_num) max_val = partialSum[lane];
+ 
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+             for (int i = 1; i < reduce_blocks; i *= 2) {
+-                auto temp = g.shfl_xor(max_val, i);
++                    auto temp = g.shuffle_xor(max_val, i);
+                 max_val = (temp > max_val ? temp : max_val);
+             }
+ 
+-            max_val = g.shfl(max_val, threadIdx.x / WARP_SIZE);
++                max_val = g.shuffle(max_val, tid / WARP_SIZE);
+         }
+ 
+         float sum = 0;
+         for (int i = 0; i < iterations; i++) {
+-            data[i].x = __expf(data[i].x - max_val);
+-            data[i].y = __expf(data[i].y - max_val);
+-            data[i].z = __expf(data[i].z - max_val);
+-            data[i].w = __expf(data[i].w - max_val);
++                data[i].x() = sycl::exp(data[i].x() - max_val);
++                data[i].y() = sycl::exp(data[i].y() - max_val);
++                data[i].z() = sycl::exp(data[i].z() - max_val);
++                data[i].w() = sycl::exp(data[i].w() - max_val);
+ 
+-            sum += (data[i].x + data[i].y + data[i].z + data[i].w);
++                sum += (data[i].x() + data[i].y() + data[i].z() + data[i].w());
+         }
+ 
+-        for (int i = 1; i < WARP_SIZE; i *= 2) sum += g.shfl_xor(sum, i);
++            for (int i = 1; i < WARP_SIZE; i *= 2) sum += g.shuffle_xor(sum, i);
+ 
+         if (reduceWidth > WARP_SIZE) {
+             if (lane == 0) partialSum[wid] = sum;
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+             if (lane < warp_num) sum = partialSum[lane];
+ 
+-            b.sync();
++                sycl::group_barrier(b, b.fence_scope);
+ 
+-            for (int i = 1; i < reduce_blocks; i *= 2) { sum += g.shfl_xor(sum, i); }
++                for (int i = 1; i < reduce_blocks; i *= 2) { sum += g.shuffle_xor(sum, i); }
+ 
+-            sum = g.shfl(sum, threadIdx.x / WARP_SIZE);
++                sum = g.shuffle(sum, tid / WARP_SIZE);
+         }
+         sum += 1e-6;
+ 
+         for (int i = 0; i < iterations; i++) {
+             int data_id = i * (reduceWidth << 2) + (seq_lane);
+             if (data_id < sequence_length) {
+-                vals[data_id] = data[i].x / sum;
++                rvals[data_id] = data[i].x() / sum;
+                 if ((data_id + reduceWidth) < sequence_length)
+-                    vals[data_id + reduceWidth] = data[i].y / sum;
++                    rvals[data_id + reduceWidth] = data[i].y() / sum;
+                 if ((data_id + reduceWidth * 2) < sequence_length)
+-                    vals[data_id + reduceWidth * 2] = data[i].z / sum;
++                    rvals[data_id + reduceWidth * 2] = data[i].z() / sum;
+                 if ((data_id + reduceWidth * 3) < sequence_length)
+-                    vals[data_id + reduceWidth * 3] = data[i].w / sum;
+-            }
++                    rvals[data_id + reduceWidth * 3] = data[i].w() / sum;
+         }
+     }
+ }
++    };
++};
+ 
+ #define LAUNCH_ATTN_SOFTMAX_V2(iterations)                                      \
+-    attn_softmax_v2<T, iterations><<<grid, block, 0, stream>>>(vals,            \
++    attn_softmax_v2<T, iterations> fn(vals,                        \
+                                                                mask,            \
+                                                                alibi,           \
+                                                                layer_scale,     \
+@@ -420,7 +501,10 @@
+                                                                head_offset,     \
+                                                                mask_stride,     \
+                                                                mp_size,         \
+-                                                               reduce_width);
++                                      reduce_width);               \
++    stream.submit([&](sycl::handler& cmd_list) {                   \
++        cmd_list.parallel_for(sycl::nd_range<1>{grid, block}, fn); \
++    });
  
  template <typename T>
- void launch_attn_softmax_v2(T *vals, T *mask, T *alibi, float layer_scale,
-@@ -437,7 +509,7 @@
-                             bool local_attention, int window_size,
-                             int batch_size, int heads, int num_seq,
-                             int sequence_length, int head_offset,
--                            int mask_stride, int mp_size, cudaStream_t stream) {
-+                            int mask_stride, int mp_size, sycl::queue stream) {
-   const int total_count = batch_size * heads * num_seq;
+ void launch_attn_softmax_v2(T* vals,
+@@ -438,7 +522,7 @@
+                             int head_offset,
+                             int mask_stride,
+                             int mp_size,
+-                            cudaStream_t stream)
++                            sycl::queue stream)
+ {
+     const int total_count = batch_size * heads * num_seq;
  
-   // Scheduling Overview
-@@ -465,8 +537,9 @@
-   const int partitions = attn_threads / reduce_width;
+@@ -464,8 +548,8 @@
+     const int partitions = attn_threads / reduce_width;
  
-   // Launch params
--  dim3 grid((total_count + partitions - 1) / partitions);
--  dim3 block(attn_threads);
-+  sycl::range<1> block(attn_threads);
-+  sycl::range<1> grid(((total_count + partitions - 1) / partitions) *
-+                      attn_threads);
+     // Launch params
+-    dim3 grid((total_count + partitions - 1) / partitions);
+-    dim3 block(attn_threads);
++    sycl::range<1> block(attn_threads);
++    sycl::range<1> grid(((total_count + partitions - 1) / partitions) * attn_threads);
  
-   if (sequence_length <= 32768) {
-     if (iterations == 1) {
-@@ -494,52 +567,20 @@
-                                      int window_size, int batch_size, int heads,
-                                      int num_seq, int sequence_length,
-                                      int head_offset, int mask_stride,
--                                     int mp_size, cudaStream_t stream);
--
+     if (sequence_length <= 32768) {
+         if (iterations == 1) {
+@@ -503,60 +587,8 @@
+                                          int head_offset,      \
+                                          int mask_stride,      \
+                                          int mp_size,          \
+-                                         cudaStream_t stream);
++                                         sycl::queue stream);
+ 
+ INSTANTIATE_LAUNCH_ATTN_SOFTMAX_V2(float);
 -#ifdef BF16_AVAILABLE
--template void launch_attn_softmax_v2(__nv_bfloat16 *vals, __nv_bfloat16 *mask,
--                                     __nv_bfloat16 *alibi, float layer_scale,
--                                     bool triangular, bool recompute,
--                                     bool local_attention, int window_size,
--                                     int batch_size, int heads, int num_seq,
--                                     int sequence_length, int head_offset,
--                                     int mask_stride, int mp_size,
--                                     cudaStream_t stream);
+-INSTANTIATE_LAUNCH_ATTN_SOFTMAX_V2(__nv_bfloat16);
 -#endif
-+                                     int mp_size, sycl::queue);
- 
--template void launch_attn_softmax_v2(__half *vals, __half *mask, __half *alibi,
-+template void launch_attn_softmax_v2(bf16 *vals, bf16 *mask, bf16 *alibi,
-                                      float layer_scale, bool triangular,
-                                      bool recompute, bool local_attention,
-                                      int window_size, int batch_size, int heads,
-                                      int num_seq, int sequence_length,
-                                      int head_offset, int mask_stride,
--                                     int mp_size, cudaStream_t stream);
-+                                     int mp_size, sycl::queue);
- 
--#define DEF_ATTN_SOFTMAX_V2_HALF(_iter)                                        \
--  template __global__ void attn_softmax_v2<__half, _iter>(                     \
--      __half * vals, __half * mask, __half * alibi, float layer_scale,         \
--      bool triangular, bool recompute, bool local_attention, int window_size,  \
--      int total_count, int heads, int sequence_length, int num_seq,            \
--      int head_offset, int mask_stride, int mp_size, int reduceWidth)
+-INSTANTIATE_LAUNCH_ATTN_SOFTMAX_V2(__half);
 -
--#define DEF_ATTN_SOFTMAX_V2_BF16(_iter)                                        \
--  template __global__ void attn_softmax_v2<__nv_bfloat16, _iter>(              \
--      __nv_bfloat16 * vals, __nv_bfloat16 * mask, __nv_bfloat16 * alibi,       \
--      float layer_scale, bool triangular, bool recompute,                      \
--      bool local_attention, int window_size, int total_count, int heads,       \
--      int sequence_length, int num_seq, int head_offset, int mask_stride,      \
--      int mp_size, int reduceWidth)
+-#define DEF_ATTN_SOFTMAX_V2_HALF(_iter)                                           \
+-    template __global__ void attn_softmax_v2<__half, _iter>(__half * vals,        \
+-                                                            __half * mask,        \
+-                                                            __half * alibi,       \
+-                                                            float layer_scale,    \
+-                                                            bool triangular,      \
+-                                                            bool recompute,       \
+-                                                            bool local_attention, \
+-                                                            int window_size,      \
+-                                                            int total_count,      \
+-                                                            int heads,            \
+-                                                            int sequence_length,  \
+-                                                            int num_seq,          \
+-                                                            int head_offset,      \
+-                                                            int mask_stride,      \
+-                                                            int mp_size,          \
+-                                                            int reduceWidth)
 -
--#define FOREACH_ITERATIONS(cb)                                                 \
--  cb(1);                                                                       \
--  cb(2);                                                                       \
--  cb(4);                                                                       \
--  cb(8);                                                                       \
--  cb(16);                                                                      \
--  cb(32);                                                                      \
--  cb(64)
+-#define DEF_ATTN_SOFTMAX_V2_BF16(_iter)                                                   \
+-    template __global__ void attn_softmax_v2<__nv_bfloat16, _iter>(__nv_bfloat16 * vals,  \
+-                                                                   __nv_bfloat16 * mask,  \
+-                                                                   __nv_bfloat16 * alibi, \
+-                                                                   float layer_scale,     \
+-                                                                   bool triangular,       \
+-                                                                   bool recompute,        \
+-                                                                   bool local_attention,  \
+-                                                                   int window_size,       \
+-                                                                   int total_count,       \
+-                                                                   int heads,             \
+-                                                                   int sequence_length,   \
+-                                                                   int num_seq,           \
+-                                                                   int head_offset,       \
+-                                                                   int mask_stride,       \
+-                                                                   int mp_size,           \
+-                                                                   int reduceWidth)
+-
+-#define FOREACH_ITERATIONS(cb) \
+-    cb(1);                     \
+-    cb(2);                     \
+-    cb(4);                     \
+-    cb(8);                     \
+-    cb(16);                    \
+-    cb(32);                    \
+-    cb(64)
 -
 -FOREACH_ITERATIONS(DEF_ATTN_SOFTMAX_V2_HALF);
 -#ifdef BF16_AVAILABLE
 -FOREACH_ITERATIONS(DEF_ATTN_SOFTMAX_V2_BF16);
 -#endif
-+template void launch_attn_softmax_v2(half *vals, half *mask, half *alibi,
-+                                     float layer_scale, bool triangular,
-+                                     bool recompute, bool local_attention,
-+                                     int window_size, int batch_size, int heads,
-+                                     int num_seq, int sequence_length,
-+                                     int head_offset, int mask_stride,
-+                                     int mp_size, sycl::queue);
++INSTANTIATE_LAUNCH_ATTN_SOFTMAX_V2(bf16);
++INSTANTIATE_LAUNCH_ATTN_SOFTMAX_V2(sycl::half);
