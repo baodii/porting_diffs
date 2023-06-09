@@ -1,0 +1,74 @@
+--- generated_code/csrc/includes/reduction_utils.h	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/includes/reduction_utils.h	2023-06-08 22:43:29.110099794 -0700
+@@ -270,43 +270,43 @@
+ template <>
+ DS_D_INLINE sycl::half init<ROpType::Add>()
+ {
+-    constexpr __half_raw zero = {0x0000};
+-    return sycl::half(zero);
++    /* constexpr __half_raw zero = {0x0000}; */
++    return sycl::half(0.0);
+ }
+ 
+ template <>
+ DS_D_INLINE sycl::half init<ROpType::Min>()
+ {
+-    constexpr __half_raw inf = {0x7C00};
++    constexpr sycl::half inf = std::numeric_limits<sycl::half>::infinity();
+     return sycl::half(inf);
+ }
+ 
+ template <>
+ DS_D_INLINE sycl::half init<ROpType::Max>()
+ {
+-    constexpr __half_raw neg_inf = {0xFC00};
++    constexpr sycl::half neg_inf = -std::numeric_limits<sycl::half>::infinity();
+     return sycl::half(neg_inf);
+ }
+ 
+ template <>
+ DS_D_INLINE sycl::half2 init<ROpType::Add>()
+ {
+-    constexpr __half2_raw zero = {0x0000, 0x0000};
+-    return sycl::half2(zero);
++    /* constexpr __half2_raw zero = {0x0000, 0x0000}; */
++    return {0.0, 0.0};
+ }
+ 
+ template <>
+ DS_D_INLINE sycl::half2 init<ROpType::Min>()
+ {
+-    constexpr __half2_raw inf = {0x7C00, 0x7C00};
+-    return sycl::half2(inf);
++    /* constexpr __half2_raw inf = {0x7C00, 0x7C00}; */
++    return {std::numeric_limits<sycl::half>::infinity(), std::numeric_limits<sycl::half>::infinity()};
+ }
+ 
+ template <>
+ DS_D_INLINE sycl::half2 init<ROpType::Max>()
+ {
+-    constexpr __half2_raw neg_inf = {0xFC00, 0xFC00};
+-    return sycl::half2(neg_inf);
++    /* constexpr __half2_raw neg_inf = {0xFC00, 0xFC00}; */
++    return {-std::numeric_limits<sycl::half>::infinity(), -std::numeric_limits<sycl::half>::infinity()};
+ }
+ 
+ template <ROpType Op, typename T>
+@@ -436,7 +436,7 @@
+     _warp<Ops...>(warp_arg, data, item_ct1);
+ 
+     // If max_warps == 1 let's skip the runtime check
+-    if (warp_arg.meta_group_size() > 1 && total_warps != 1) {
++    if (warp_arg.get_group_range().size() > 1 && total_warps != 1) {
+         if (item_ct1.get_sub_group().get_local_linear_id() == 0) {
+ #pragma unroll
+             for (int i = 0; i < elems; i++) {
+@@ -455,7 +455,7 @@
+         item_ct1.barrier();
+ 
+         if (item_ct1.get_sub_group().get_group_linear_id() == 0) {
+-            if (item_ct1.get_sub_group().get_local_linear_id() < warp_arg.meta_group_size()) {
++            if (item_ct1.get_sub_group().get_local_linear_id() < warp_arg.get_group_range().size()) {
+ #pragma unroll
+                 for (int i = 0; i < elems; i++) {
+                     mem_access::load_shared<bytes>(

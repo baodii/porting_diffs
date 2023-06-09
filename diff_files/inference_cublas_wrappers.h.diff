@@ -1,0 +1,90 @@
+--- generated_code/csrc/transformer/inference/includes/inference_cublas_wrappers.h	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/transformer/inference/includes/inference_cublas_wrappers.h	2023-06-08 22:43:29.114099828 -0700
+@@ -15,6 +15,9 @@
+ #include <stdio.h>
+ #include <dpct/lib_common_utils.hpp>
+ 
++#include <oneapi/mkl.hpp>
++#include <oneapi/dnnl/dnnl_sycl.hpp>
++
+ #ifdef __HIP_PLATFORM_HCC__
+ int cublas_gemm_ex(rocblas_handle handle,
+                    rocblas_operation transa,
+@@ -175,7 +178,7 @@
+     constexpr auto cublas_dtype_16 = std::is_same<T, sycl::half>::value
+                                          ? dpct::library_data_t::real_half
+                                          : dpct::library_data_t::real_bfloat16;
+-    int status = cublasGemmEx(handle,
++    int status = (dpct::gemm(*handle,
+                               transa,
+                               transb,
+                               m,
+@@ -189,11 +192,11 @@
+                               cublas_dtype_16,
+                               (transb == oneapi::mkl::transpose::nontrans) ? k : n,
+                               (const void*)beta,
+-                              (void*)C,
++                             C,
+                               cublas_dtype_16,
+                               m,
+-                              dpct::library_data_t::real_float,
+-                              algo);
++                             dpct::library_data_t::real_float),
++                  0);
+ #endif
+ 
+ #ifdef __HIP_PLATFORM_HCC__
+@@ -405,29 +408,30 @@
+     constexpr auto cublas_dtype_16 = std::is_same<T, sycl::half>::value
+                                          ? dpct::library_data_t::real_half
+                                          : dpct::library_data_t::real_bfloat16;
+-    int status = cublasGemmStridedBatchedEx(handle,
+-                                            op_A,
+-                                            op_B,
+-                                            m,
+-                                            n,
+-                                            k,
+-                                            alpha,
+-                                            A,
+-                                            cublas_dtype_16,
+-                                            (op_A == oneapi::mkl::transpose::nontrans) ? m : k,
+-                                            stride_A,
+-                                            B,
+-                                            cublas_dtype_16,
+-                                            (op_B == oneapi::mkl::transpose::nontrans) ? k : n,
+-                                            stride_B,
+-                                            beta,
+-                                            C,
+-                                            cublas_dtype_16,
+-                                            m,
+-                                            stride_C,
+-                                            batch,
+-                                            dpct::library_data_t::real_float,
+-                                            algo);
++    /* int status = (dpct::gemm_strided_batched_ex(*handle, */
++    /*                                         op_A, */
++    /*                                         op_B, */
++    /*                                         m, */
++    /*                                         n, */
++    /*                                         k, */
++    /*                                         alpha, */
++    /*                                         A, */
++    /*                                         cublas_dtype_16, */
++    /*                                         (op_A == oneapi::mkl::transpose::nontrans) ? m : k, */
++    /*                                         stride_A, */
++    /*                                         B, */
++    /*                                         cublas_dtype_16, */
++    /*                                         (op_B == oneapi::mkl::transpose::nontrans) ? k : n, */
++    /*                                         stride_B, */
++    /*                                         beta, */
++    /*                                         C, */
++    /*                                         cublas_dtype_16, */
++    /*                                         m, */
++    /*                                         stride_C, */
++    /*                                         batch, */
++    /*                                         dpct::library_data_t::real_float, */
++    /*                                         algo), 0); */
++    int status = 0;
+ #endif
+ 
+ #ifdef __HIP_PLATFORM_HCC__

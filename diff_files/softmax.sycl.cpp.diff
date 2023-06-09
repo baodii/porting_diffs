@@ -1,0 +1,47 @@
+--- generated_code/csrc/transformer/inference/csrc/softmax.sycl.cpp	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/transformer/inference/csrc/softmax.sycl.cpp	2023-06-08 22:43:29.110099794 -0700
+@@ -234,7 +234,7 @@
+                 max_val = (temp > max_val ? temp : max_val);
+             }
+ 
+-            max_val = g.shfl(max_val, item_ct1.get_local_id(2) / WARP_SIZE);
++            max_val = g.shuffle(max_val, item_ct1.get_local_id(2) / WARP_SIZE);
+         }
+         float sum = 0;
+         for (int i = 0; i < iterations; i++) {
+@@ -271,7 +271,7 @@
+                 sum += sycl::permute_group_by_xor(item_ct1.get_sub_group(), sum, i);
+             }
+ 
+-            sum = g.shfl(sum, item_ct1.get_local_id(2) / WARP_SIZE);
++            sum = g.shuffle(sum, item_ct1.get_local_id(2) / WARP_SIZE);
+         }
+         sum += 1e-6;
+         for (int i = 0; i < iterations; i++) {
+@@ -413,7 +413,7 @@
+                 max_val = (temp > max_val ? temp : max_val);
+             }
+ 
+-            max_val = g.shfl(max_val, item_ct1.get_local_id(2) / WARP_SIZE);
++            max_val = g.shuffle(max_val, item_ct1.get_local_id(2) / WARP_SIZE);
+         }
+ 
+         float sum = 0;
+@@ -451,7 +451,7 @@
+                 sum += sycl::permute_group_by_xor(item_ct1.get_sub_group(), sum, i);
+             }
+ 
+-            sum = g.shfl(sum, item_ct1.get_local_id(2) / WARP_SIZE);
++            sum = g.shuffle(sum, item_ct1.get_local_id(2) / WARP_SIZE);
+         }
+         sum += 1e-6;
+ 
+@@ -503,7 +503,7 @@
+                                                                                                    \
+       cgh.parallel_for(sycl::nd_range<3>(grid * block, block),                                     \
+                        [=](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {         \
+-                         attn_softmax_v2<T>(vals_ct0,                                              \
++                         attn_softmax_v2<T, iterations>(vals_ct0,                                              \
+                                             mask_ct1,                                              \
+                                             alibi_ct2,                                             \
+                                             layer_scale_ct3,                                       \

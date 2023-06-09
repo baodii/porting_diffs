@@ -1,0 +1,131 @@
+--- generated_code/csrc/includes/memory_access_utils.h	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/includes/memory_access_utils.h	2023-06-08 22:43:29.110099794 -0700
+@@ -82,14 +82,16 @@
+ 
+ __dpct_inline__ uint32_t lane_id()
+ {
+-#ifdef PTX_AVAILABLE
+-    unsigned int lane_id;
+-  lane_id = item_ct1.get_sub_group().get_local_linear_id();
+-
+-    return lane_id;
+-#else
+-    return threadIdx.x & (warpSize - 1);  // Portable
+-#endif
++    auto pos = sycl::ext::oneapi::experimental::this_nd_item<1>();
++    return pos.get_local_id(0) & (hw_warp_size - 1);  // Portable
++/* #ifdef PTX_AVAILABLE */
++/*     unsigned int lane_id; */
++/*   lane_id = item_ct1.get_sub_group().get_local_linear_id(); */
++
++/*     return lane_id; */
++/* #else */
++/*     return threadIdx.x & (warpSize - 1);  // Portable */
++/* #endif */
+ }
+ 
+ /////////// Load Global ///////////
+@@ -135,10 +137,10 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
+-        data[0].z = 0;
+-        data[0].w = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
++        data[0].z() = 0;
++        data[0].w() = 0;
+     }
+ #endif
+ }
+@@ -187,10 +189,10 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
+-        data[0].z = 0;
+-        data[0].w = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
++        data[0].z() = 0;
++        data[0].w() = 0;
+     }
+ #endif
+ }
+@@ -239,10 +241,10 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
+-        data[0].z = 0;
+-        data[0].w = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
++        data[0].z() = 0;
++        data[0].w() = 0;
+     }
+ #endif
+ }
+@@ -287,8 +289,8 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
+     }
+ #endif
+ }
+@@ -335,8 +337,8 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
+     }
+ #endif
+ }
+@@ -383,8 +385,8 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
+     }
+ #endif
+ }
+@@ -721,10 +723,10 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
+-        data[0].z = 0;
+-        data[0].w = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
++        data[0].z() = 0;
++        data[0].w() = 0;
+     }
+ #endif
+ }
+@@ -773,8 +775,8 @@
+     if (do_access) {
+         data[0] = src_cast[0];
+     } else {
+-        data[0].x = 0;
+-        data[0].y = 0;
++        data[0].x() = 0;
++        data[0].y() = 0;
+     }
+ #endif
+ }

@@ -1,0 +1,479 @@
+--- generated_code/csrc/transformer/inference/csrc/pt_binding.cpp	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/transformer/inference/csrc/pt_binding.cpp	2023-06-08 22:43:29.114099828 -0700
+@@ -5,7 +5,7 @@
+ 
+ #include <sycl/sycl.hpp>
+ #include <dpct/dpct.hpp>
+-#include <c10/cuda/CUDAStream.h>
++/* #include <c10/cuda/CUDAStream.h> */
+ #include <torch/extension.h>
+ #include <stdexcept>
+ #include <vector>
+@@ -134,7 +134,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(Q.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+     T* workspace = (T*)InferenceContext::Instance().GetWorkSpace();
+     float alpha = 1;
+@@ -152,7 +152,7 @@
+     unsigned m = W.size(1);
+     unsigned n = Q.size(1) * Q.size(2);
+     unsigned k = Q.size(0);
+-    cublas_gemm_ex(InferenceContext::Instance().GetCublasHandle(),
++    cublas_gemm_ex(InferenceContext::Instance().GetCurrentStream(),
+                    oneapi::mkl::transpose::nontrans,
+                    oneapi::mkl::transpose::trans,
+                    m,
+@@ -190,7 +190,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(query_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+     float alpha = norm_factor;
+     float gemm_beta = 0.0;
+@@ -199,9 +199,9 @@
+ 
+     auto mask_stride = get_attn_mask_stride(attn_mask);
+ 
+-    InferenceContext::Instance().GetCublasHandle() =
+-        InferenceContext::Instance().GetCurrentStream();
+-    cublas_strided_batched_gemm(InferenceContext::Instance().GetCublasHandle(),
++    // InferenceContext::Instance().GetCurrentStream() =
++    //    InferenceContext::Instance().GetCurrentStream();
++    cublas_strided_batched_gemm(InferenceContext::Instance().GetCurrentStream(),
+                                 soft_len,
+                                 seq_len,
+                                 k,
+@@ -238,7 +238,7 @@
+                            1,
+                            InferenceContext::Instance().GetCurrentStream(false));
+     alpha = 1.0;
+-    cublas_strided_batched_gemm(InferenceContext::Instance().GetCublasHandle(),
++    cublas_strided_batched_gemm(InferenceContext::Instance().GetCurrentStream(),
+                                 k,
+                                 seq_len,
+                                 soft_len,
+@@ -290,7 +290,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(query_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     auto output =
+@@ -344,7 +344,7 @@
+                            0,
+                            mask_stride,
+                            1,
+-                           at::cuda::getCurrentCUDAStream());
++                           InferenceContext::Instance().GetCurrentStream());
+ }
+ 
+ template <typename T>
+@@ -371,9 +371,9 @@
+     float gemm_beta = 0.0;
+     T* workspace = (T*)InferenceContext::Instance().GetAttentionUnfusedWorkspace();
+ 
+-    InferenceContext::Instance().GetCublasHandle() =
+-        InferenceContext::Instance().GetCurrentStream();
+-    cublas_strided_batched_gemm(InferenceContext::Instance().GetCublasHandle(),
++    // InferenceContext::Instance().GetCurrentStream() =
++    //    InferenceContext::Instance().GetCurrentStream();
++    cublas_strided_batched_gemm(InferenceContext::Instance().GetCurrentStream(),
+                                 soft_len,
+                                 seq_len,
+                                 k,
+@@ -406,7 +406,7 @@
+                            soft_len,
+                            heads);
+     alpha = 1.0;
+-    cublas_strided_batched_gemm(InferenceContext::Instance().GetCublasHandle(),
++    cublas_strided_batched_gemm(InferenceContext::Instance().GetCurrentStream(),
+                                 k,
+                                 seq_len,
+                                 soft_len,
+@@ -459,7 +459,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(query_key_value.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     T* workspace = (T*)InferenceContext::Instance().GetWorkSpace();
+@@ -535,8 +535,8 @@
+     if (layer_id == num_layers - 1) InferenceContext::Instance().advance_tokens();
+     auto prev_key = torch::from_blob(workspace + offset,
+                                      {bsz, heads, all_tokens, k},
+-                                     {hidden_dim * InferenceContext::Instance().GetMaxTokenLenght(),
+-                                      k * InferenceContext::Instance().GetMaxTokenLenght(),
++                                     {long(hidden_dim * InferenceContext::Instance().GetMaxTokenLenght()),
++                                      long(k * InferenceContext::Instance().GetMaxTokenLenght()),
+                                       k,
+                                       1},
+                                      options);
+@@ -544,8 +544,8 @@
+     auto prev_value =
+         torch::from_blob(workspace + offset + value_offset,
+                          {bsz, heads, all_tokens, k},
+-                         {hidden_dim * InferenceContext::Instance().GetMaxTokenLenght(),
+-                          k * InferenceContext::Instance().GetMaxTokenLenght(),
++                         {long(hidden_dim * InferenceContext::Instance().GetMaxTokenLenght()),
++                          long(k * InferenceContext::Instance().GetMaxTokenLenght()),
+                           k,
+                           1},
+                          options);
+@@ -795,7 +795,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(at::kHalf)
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+     auto tmp = torch::empty(weight.sizes(), options);
+     T* weight16 = (T*)tmp.data_ptr();
+@@ -809,7 +809,7 @@
+ 
+     float alpha = (T)1.0;
+     float gemm_beta = (T)0.0;
+-    cublas_gemm_ex(InferenceContext::Instance().GetCublasHandle(),
++    cublas_gemm_ex(InferenceContext::Instance().GetCurrentStream(),
+                    oneapi::mkl::transpose::trans,
+                    oneapi::mkl::transpose::nontrans,
+                    weight.size(0),
+@@ -852,10 +852,10 @@
+         float alpha = (T)1.0;
+         float gemm_beta = (T)0.0;
+ 
+-        InferenceContext::Instance().GetCublasHandle() =
+-            InferenceContext::Instance().GetCurrentStream();
++        // InferenceContext::Instance().GetCurrentStream() =
++        //    InferenceContext::Instance().GetCurrentStream();
+         cublas_gemm_ex(
+-            InferenceContext::Instance().GetCublasHandle(),
++            InferenceContext::Instance().GetCurrentStream(),
+             (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+             oneapi::mkl::transpose::nontrans,
+             weight.size(transposed_mode ? 0 : 1),
+@@ -878,7 +878,10 @@
+                         (transposed_mode || q_int8) ? weight.size(0) : weight.size(1),
+                         bsz,
+                         InferenceContext::Instance().GetCurrentStream());
+-    return torch::from_blob(workspace, input.sizes(), input.options());
++    
++    auto output_stride = c10::TensorType::contiguousStridesOf(input.sizes());
++    return at::from_blob(
++        workspace, input.sizes(),output_stride, nullptr, input.options(), input.device());
+ }
+ 
+ template <typename T>
+@@ -904,10 +907,19 @@
+     auto options = at::TensorOptions()
+                        .dtype(input.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+-    auto output = at::from_blob(workspace, {input.size(0), input.size(1), out_size}, options);
++    auto output_stride =
++        c10::TensorType::contiguousStridesOf({input.size(0), input.size(1), out_size});
++
++    auto output = at::from_blob(workspace, 
++                                {input.size(0), input.size(1), out_size}, 
++                                output_stride,
++                                nullptr,
++                                options,
++                                input.device());
++
+     auto inp_norm = qkv_unfused_cublas<T>(output,
+                                           input,
+                                           weight,
+@@ -935,7 +947,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+     auto weight16 = at::empty({weight.size(0), weight.size(1)}, options);
+ 
+@@ -950,7 +962,7 @@
+ 
+     float alpha = (T)1.0;
+     float gemm_beta = (T)0.0;
+-    cublas_gemm_ex(InferenceContext::Instance().GetCublasHandle(),
++    cublas_gemm_ex(InferenceContext::Instance().GetCurrentStream(),
+                    oneapi::mkl::transpose::trans,
+                    oneapi::mkl::transpose::nontrans,
+                    weight.size(0),
+@@ -984,7 +996,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     auto output = at::empty({input_cont.size(0), input_cont.size(1), weight.size(1)}, options);
+@@ -1015,7 +1027,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     int head_size = input_cont.size(2) / num_heads;
+@@ -1025,11 +1037,11 @@
+ 
+     float alpha = (T)1.0;
+     float gemm_beta = (T)0.0;
+-    InferenceContext::Instance().GetCublasHandle() =
+-        InferenceContext::Instance().GetCurrentStream();
++    // InferenceContext::Instance().GetCurrentStream() =
++    //    InferenceContext::Instance().GetCurrentStream();
+ 
+     cublas_gemm_ex(
+-        InferenceContext::Instance().GetCublasHandle(),
++        InferenceContext::Instance().GetCurrentStream(),
+         (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+         oneapi::mkl::transpose::nontrans,
+         weight.size(transposed_mode ? 0 : 1),
+@@ -1222,7 +1234,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+     int bsz = input_cont.size(0) * input_cont.size(1);
+ 
+@@ -1248,13 +1260,21 @@
+     auto options = at::TensorOptions()
+                        .dtype(input.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+     int out_size = q_int8 ? weight.size(0) : weight.size(1);
+     int bsz = input.size(0) * input.size(1);
+ 
+     T* workspace = (T*)InferenceContext::Instance().GetWorkSpace();
+-    auto output = at::from_blob(workspace, {input.size(0), input.size(1), out_size}, options);
++    
++    auto output_stride =
++        c10::TensorType::contiguousStridesOf({input.size(0), input.size(1), out_size});
++    auto output = at::from_blob(workspace, 
++                                {input.size(0), input.size(1), out_size}, 
++                                output_stride,
++                                nullptr,
++                                options,
++                                input.device());
+     if (q_int8) {
+         quantized_gemm<T>(output.data_ptr(),
+                           (T*)input.data_ptr(),
+@@ -1266,10 +1286,10 @@
+     } else {
+         float alpha = (T)1.0;
+         float gemm_beta = (T)0.0;
+-        InferenceContext::Instance().GetCublasHandle() =
+-            InferenceContext::Instance().GetCurrentStream(async_op);
++        // InferenceContext::Instance().GetCurrentStream() =
++        //    InferenceContext::Instance().GetCurrentStream(async_op);
+         cublas_gemm_ex(
+-            InferenceContext::Instance().GetCublasHandle(),
++            InferenceContext::Instance().GetCurrentStream(),
+             (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+             oneapi::mkl::transpose::nontrans,
+             weight.size(transposed_mode ? 0 : 1),
+@@ -1300,7 +1320,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     auto output = at::empty({input_cont.size(0), input_cont.size(1), weight.size(1)}, options);
+@@ -1353,10 +1373,10 @@
+     } else {
+         float alpha = (T)1.0;
+         float gemm_beta = (T)0.0;
+-        InferenceContext::Instance().GetCublasHandle() =
+-            InferenceContext::Instance().GetCurrentStream();
++        // InferenceContext::Instance().GetCurrentStream() =
++        //    InferenceContext::Instance().GetCurrentStream();
+         cublas_gemm_ex(
+-            InferenceContext::Instance().GetCublasHandle(),
++            InferenceContext::Instance().GetCurrentStream(),
+             (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+             oneapi::mkl::transpose::nontrans,
+             weight.size(transposed_mode ? 0 : 1),
+@@ -1398,10 +1418,10 @@
+     } else {
+         float alpha = (T)1.0;
+         float gemm_beta = (T)0.0;
+-        InferenceContext::Instance().GetCublasHandle() =
+-            InferenceContext::Instance().GetCurrentStream();
++        // InferenceContext::Instance().GetCurrentStream() =
++        //    InferenceContext::Instance().GetCurrentStream();
+         cublas_gemm_ex(
+-            InferenceContext::Instance().GetCublasHandle(),
++            InferenceContext::Instance().GetCurrentStream(),
+             (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+             oneapi::mkl::transpose::nontrans,
+             weight1.size(transposed_mode ? 0 : 1),
+@@ -1419,7 +1439,9 @@
+ #endif
+     }
+ 
+-    return torch::from_blob(inp_norm, input.sizes(), input.options());
++    auto output_stride = c10::TensorType::contiguousStridesOf(input.sizes());
++    return at::from_blob(
++        inp_norm, input.sizes(), output_stride, nullptr, input.options(), input.device());
+ }
+ 
+ template <typename T>
+@@ -1443,14 +1465,19 @@
+     auto options = at::TensorOptions()
+                        .dtype(input.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     int out_size = (q_int8 || transposed_mode) ? weight_out.size(0) : weight_out.size(1);
++    auto output_stride =
++        c10::TensorType::contiguousStridesOf({input.size(0), input.size(1), out_size});
+     auto output =
+         at::from_blob((T*)InferenceContext::Instance().GetWorkSpace() + torch::numel(input),
+                       {input.size(0), input.size(1), out_size},
+-                      options);
++                      output_stride,
++                      nullptr,
++                      options,
++                      input.device());
+     int bsz = input.size(0) * input.size(1);
+ 
+     auto act_func_type = static_cast<ActivationFuncType>(activation_type);
+@@ -1492,7 +1519,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     auto output = at::empty({input_cont.size(0), input_cont.size(1), weight.size(1)}, options);
+@@ -1527,7 +1554,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     int intm_dim = (transposed_mode || q_int8) ? weight.size(0) : weight.size(1);
+@@ -1552,10 +1579,10 @@
+                           bsz,
+                           input.size(2));
+     } else {
+-        InferenceContext::Instance().GetCublasHandle() =
+-            InferenceContext::Instance().GetCurrentStream();
++        // InferenceContext::Instance().GetCurrentStream() =
++        //    InferenceContext::Instance().GetCurrentStream();
+         cublas_gemm_ex(
+-            InferenceContext::Instance().GetCublasHandle(),
++            InferenceContext::Instance().GetCurrentStream(),
+             (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+             oneapi::mkl::transpose::nontrans,
+             intm_dim,
+@@ -1590,7 +1617,7 @@
+                           input.size(2));
+     } else {
+         cublas_gemm_ex(
+-            InferenceContext::Instance().GetCublasHandle(),
++            InferenceContext::Instance().GetCurrentStream(),
+             (transposed_mode ? oneapi::mkl::transpose::trans : oneapi::mkl::transpose::nontrans),
+             oneapi::mkl::transpose::nontrans,
+             out_size,
+@@ -1707,7 +1734,7 @@
+     auto options = at::TensorOptions()
+                        .dtype(input_cont.options().dtype())
+                        .layout(at::kStrided)
+-                       .device(at::kCUDA)
++                       .device(at::kXPU)
+                        .requires_grad(false);
+ 
+     auto output = at::empty({input_cont.size(0), input_cont.size(1), weight.size(1)}, options);
+@@ -1728,21 +1755,21 @@
+ {
+     int M = moe_res.size(0) * moe_res.size(1);
+     int N = moe_res.size(2);
+-    InferenceContext::Instance().SynchComm();
++    /* InferenceContext::Instance().SynchComm(); */
+     if (moe_res.scalar_type() == at::kFloat) {
+         launch_moe_res_matmul<float>((float*)moe_res.data_ptr(),
+                                      (float*)coef.data_ptr(),
+                                      (float*)output.data_ptr(),
+                                      M,
+                                      N,
+-                                     at::cuda::getCurrentCUDAStream());
++                                     InferenceContext::Instance().GetCurrentStream());
+     } else {
+-        launch_moe_res_matmul<__half>((__half*)moe_res.data_ptr(),
+-                                      (__half*)coef.data_ptr(),
+-                                      (__half*)output.data_ptr(),
++        launch_moe_res_matmul<sycl::half>((sycl::half*)moe_res.data_ptr(),
++                                      (sycl::half*)coef.data_ptr(),
++                                      (sycl::half*)output.data_ptr(),
+                                       M,
+                                       N,
+-                                      at::cuda::getCurrentCUDAStream());
++                                      InferenceContext::Instance().GetCurrentStream());
+     }
+     return output;
+ }
+@@ -1754,7 +1781,7 @@
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+ {
+     m.def("softmax_context_int8",
+-          &ds_softmax_context1<__half>,
++          &ds_softmax_context1<sycl::half>,
+           "DeepSpeed attention with int8 (CUDA)");
+     m.def("bias_geglu", &ds_bias_geglu, "DeepSpeed Bias GEGLU (CUDA)");
+     m.def("layer_norm", &ds_layer_norm, "DeepSpeed layer norm (CUDA)");
+@@ -1763,13 +1790,13 @@
+     m.def("layer_norm_residual_store_pre_ln_res",
+           &ds_layer_norm_residual_store_pre_ln_res,
+           "DeepSpeed layer norm + store pre Layernorm residual (CUDA)");
+-    m.def("qkv_gemm_int8", &ds_qkv_gemm_int8<__half>, "DeepSpeed qkv gemm with int8 (CUDA)");
+-    m.def("mlp_gemm_int8", &ds_mlp_gemm_int8<__half>, "DeepSpeed mlp with int8 (CUDA)");
++    m.def("qkv_gemm_int8", &ds_qkv_gemm_int8<sycl::half>, "DeepSpeed qkv gemm with int8 (CUDA)");
++    m.def("mlp_gemm_int8", &ds_mlp_gemm_int8<sycl::half>, "DeepSpeed mlp with int8 (CUDA)");
+     m.def("vector_matmul_int8",
+-          &ds_vector_matmul_int8<__half>,
++          &ds_vector_matmul_int8<sycl::half>,
+           "DeepSpeed vector-MM with int8 (CUDA)");
+     m.def("linear_layer_int8",
+-          &ds_linear_layer_int8<__half>,
++          &ds_linear_layer_int8<sycl::half>,
+           "DeepSpeed linear_layer with int8 (CUDA)");
+     m.def("apply_rotary_pos_emb", &apply_rotary_pos_emb, "DeepSpeed mlp with fp16 (CUDA)");
+     m.def("moe_res_matmul", &moe_res_matmul, "DeepSpeed moe residual matmul (CUDA)");
+@@ -1816,7 +1843,7 @@
+           "DeepSpeed memory allocation for GPT inference with " #_name " (CUDA)")
+ 
+     DEF_OPS(fp32, float);
+-    DEF_OPS(fp16, __half);
++    DEF_OPS(fp16, sycl::half);
+ #ifdef BF16_AVAILABLE
+     DEF_OPS(bf16, __nv_bfloat16);
+ #endif

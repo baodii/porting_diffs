@@ -1,0 +1,55 @@
+--- generated_code/csrc/transformer/inference/csrc/layer_norm.sycl.cpp	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/transformer/inference/csrc/layer_norm.sycl.cpp	2023-06-08 22:43:29.114099828 -0700
+@@ -51,9 +51,9 @@
+ 
+     // X-dimension of the block
+     const int block_offset =
+-        (tb.group_index()[2] * (maxThreads / threadsPerGroup) * elems_per_row) +
+-        (tb.thread_index()[1] * elems_per_row);
+-    const int thread_offset = tb.thread_index()[2] * T_per_load;
++        (tb.get_group_id()[2] * (maxThreads / threadsPerGroup) * elems_per_row) +
++        (tb.get_local_id()[1] * elems_per_row);
++    const int thread_offset = tb.get_local_id()[2] * T_per_load;
+     const int base_offset = block_offset + thread_offset;
+     const int stride = item_ct1.get_group().get_local_linear_range() * T_per_load;
+ 
+@@ -142,7 +142,7 @@
+   {                                                                                               \
+     dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp64, sycl::aspect::fp16}); \
+     stream->submit([&](sycl::handler& cgh) {                                                      \
+-      sycl::local_accessor<float, 1> reduce_buffer_acc_ct1(sycl::range<1>(max_warps * elems),     \
++      sycl::local_accessor<float, 1> reduce_buffer_acc_ct1(sycl::range<1>(hw_warp_size * 2),     \
+                                                            cgh);                                  \
+                                                                                                   \
+       auto output_ct0 = output;                                                                   \
+@@ -301,9 +301,9 @@
+ 
+     // X-dimension of the block
+     const int block_offset =
+-        (tb.group_index()[2] * (maxThreads / threadsPerGroup) * elems_per_row) +
+-        (tb.thread_index()[1] * elems_per_row);
+-    const int thread_offset = tb.thread_index()[2] * T_per_load;
++        (tb.get_group_id()[2] * (maxThreads / threadsPerGroup) * elems_per_row) +
++        (tb.get_local_id()[1] * elems_per_row);
++    const int thread_offset = tb.get_local_id()[2] * T_per_load;
+     const int base_offset = block_offset + thread_offset;
+     const int stride = item_ct1.get_group().get_local_linear_range() * T_per_load;
+ 
+@@ -411,7 +411,7 @@
+   {                                                                                               \
+     dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp64, sycl::aspect::fp16}); \
+     stream->submit([&](sycl::handler& cgh) {                                                      \
+-      sycl::local_accessor<float, 1> reduce_buffer_acc_ct1(sycl::range<1>(max_warps * elems),     \
++      sycl::local_accessor<float, 1> reduce_buffer_acc_ct1(sycl::range<1>(hw_warp_size * 2),     \
+                                                            cgh);                                  \
+                                                                                                   \
+       auto output_ct0 = output;                                                                   \
+@@ -518,7 +518,7 @@
+   {                                                                                               \
+     dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp64, sycl::aspect::fp16}); \
+     stream->submit([&](sycl::handler& cgh) {                                                      \
+-      sycl::local_accessor<float, 1> reduce_buffer_acc_ct1(sycl::range<1>(max_warps * elems),     \
++      sycl::local_accessor<float, 1> reduce_buffer_acc_ct1(sycl::range<1>(hw_warp_size * 2),     \
+                                                            cgh);                                  \
+                                                                                                   \
+       auto norm_output_ct0 = norm_output;                                                         \

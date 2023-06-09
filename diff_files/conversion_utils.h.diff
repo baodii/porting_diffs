@@ -1,0 +1,44 @@
+--- generated_code/csrc/includes/conversion_utils.h	2023-06-08 22:43:13.713967768 -0700
++++ manual_fixed/csrc/includes/conversion_utils.h	2023-06-08 22:43:29.110099794 -0700
+@@ -21,7 +21,7 @@
+ template <typename TO, typename FROM>
+ DS_D_INLINE TO to(FROM val)
+ {
+-    return to(val);
++    return static_cast<TO>(val);
+ }
+ 
+ // Specializations
+@@ -268,19 +268,19 @@
+ #endif
+ 
+ /*********************  To Half Conversions *********************/
+-template <>
+-DS_D_INLINE sycl::half to(double val)
+-{
+-#ifdef __HIP_PLATFORM_HCC__
+-    float val_f = __double2float_rn(val);
+-    return __float2half(val_f);
+-#else
+-    /*
+-    DPCT1007:50: Migration of __double2half is not supported.
+-    */
+-    return __double2half(val);
+-#endif
+-}
++/*template <> */
++/*DS_D_INLINE sycl::half to(double val) */
++/*{ */
++/*#ifdef __HIP_PLATFORM_HCC__ */
++/*    float val_f = __double2float_rn(val); */
++/*    return __float2half(val_f); */
++/*#else */
++/*    /1* */
++/*    DPCT1007:50: Migration of __double2half is not supported. */
++/*    *1/ */
++/*    return __double2half(val); */
++/*#endif */
++/*} */
+ template <>
+ DS_D_INLINE sycl::half to(float val)
+ {

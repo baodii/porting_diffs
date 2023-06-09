@@ -1,0 +1,11 @@
+--- generated_code/csrc/transformer/inference/csrc/transform.sycl.cpp	2023-06-08 22:43:13.717967801 -0700
++++ manual_fixed/csrc/transformer/inference/csrc/transform.sycl.cpp	2023-06-08 22:43:29.114099828 -0700
+@@ -838,7 +838,7 @@
+ }
+ 
+ template <typename T>
+-void launch_transform4d_0213<T>(T* out,
++void launch_transform4d_0213(T* out,
+                                 const T* in,
+                                 int batch_size,
+                                 int heads,
