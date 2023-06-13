@@ -63,15 +63,13 @@ public:
           _attention_unfused_workspace_offset(0),
           _workSpaceSize(0)
     {
-        auto type_ = c10::DeviceType::XPU;
-        c10::impl::VirtualGuardImpl impl(type_);
-        auto device_ = c10::Device(type_);
-        c10::Stream stream = impl.getStream(device_);
-        
+        dpct::device_ext &dev_ct1 = dpct::get_current_device();
+        _cublasHandle = dev_ct1.default_queue();
+  
         _workSpaceSize = 0;
         _workspace = 0;
-        if ((_cublasHandle = xpu::get_queue_from_stream(stream), 0) != 0) {
-            auto message = std::string("Fail to create onemkl handle.");
+        if (0) {
+            auto message = std::string("Fail to create cublas handle.");
             std::cerr << message << std::endl;
             throw std::runtime_error(message);
         }
@@ -229,6 +227,10 @@ public:
     /* } */
     dpct::queue_ptr GetCurrentStream(bool other_stream = false)
     {
+        /* dpct::device_ext &dev_ct1 = dpct::get_current_device(); */
+        /* dpct::queue_ptr stream1; */
+        /* stream1 = dev_ct1.create_queue(); */
+        /* return stream1; */
         auto type_ = c10::DeviceType::XPU;
         c10::impl::VirtualGuardImpl impl(type_);
         auto device_ = c10::Device(type_);
