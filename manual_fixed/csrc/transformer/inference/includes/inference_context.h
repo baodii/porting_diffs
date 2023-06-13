@@ -6,16 +6,17 @@
 #pragma once
 
 
-#include <ATen/record_function.h>
+#include <sycl/sycl.hpp>
+#include <dpct/dpct.hpp>
 #include <c10/core/Stream.h>
 #include <ipex.h>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <cassert>
 #include <iostream>
+#include <vector>
 #include <oneapi/mkl.hpp>
 #include <oneapi/mkl/rng/device.hpp>
-#include <vector>
 
 #define MEGABYTE (1024 * 1024)
 #define GIGABYTE (1024 * 1024 * 1024)
@@ -66,11 +67,10 @@ public:
         c10::impl::VirtualGuardImpl impl(type_);
         auto device_ = c10::Device(type_);
         c10::Stream stream = impl.getStream(device_);
-        _gen = new oneapi::mkl::rng::philox4x32x10(xpu::get_queue_from_stream(stream), 123);
         
         _workSpaceSize = 0;
         _workspace = 0;
-        if ((_onemklQ = xpu::get_queue_from_stream(stream), 0) != 0) {
+        if ((_cublasHandle = xpu::get_queue_from_stream(stream), 0) != 0) {
             auto message = std::string("Fail to create onemkl handle.");
             std::cerr << message << std::endl;
             throw std::runtime_error(message);
@@ -87,13 +87,11 @@ public:
     virtual ~InferenceContext()
     {
         /* cublasDestroy(_cublasHandle); */
-        free(_gen);
-        
-        auto type_ = c10::DeviceType::XPU;
-        c10::impl::VirtualGuardImpl impl(type_);
-        auto device_ = c10::Device(type_);
-        c10::Stream stream = impl.getStream(device_);
-        sycl::free(_workspace, xpu::get_queue_from_stream(stream));
+        sycl::free(_workspace, dpct::get_default_queue());
+        dpct::destroy_event(_comp1_event);
+        dpct::destroy_event(_comp2_event);
+        dpct::destroy_event(_comp_event);
+        dpct::destroy_event(_comm_event);
     }
 
     static InferenceContext& Instance()
@@ -236,14 +234,6 @@ public:
         auto device_ = c10::Device(type_);
         c10::Stream stream = impl.getStream(device_);
         return &xpu::get_queue_from_stream(stream);
-        // get current pytorch stream.
-        
-        /* if (other_stream) { */
-        /*     if (!_stream) _stream = at::cuda::getStreamFromPool(true); */
-        /*     return _stream; */
-        /* } */
-        /* dpct::queue_ptr stream = &dpct::get_default_queue(); */
-        /* return stream; */
     }
 
     void release_workspace()
@@ -257,8 +247,7 @@ public:
         _workspace = (void*)sycl::malloc_device(_workSpaceSize, dpct::get_default_queue());
         return _workspace != nullptr;
     }
-    /* dpct::queue_ptr GetCublasHandle() { return _cublasHandle; } */
-    sycl::queue GetOneMKLQ() { return _onemklQ; }
+    dpct::queue_ptr GetCublasHandle() { return &_cublasHandle; }
 
     std::pair<uint64_t, uint64_t> IncrementOffset(uint64_t offset_inc)
     {
@@ -284,8 +273,7 @@ public:
 
 private:
     /* cublasHandle_t _cublasHandle; */
-    oneapi::mkl::rng::philox4x32x10* _gen;
-    sycl::queue _onemklQ;
+    sycl::queue _cublasHandle;
 
     dpct::event_ptr _comp_event;
     dpct::event_ptr _comm_event;
