@@ -1,12 +1,15 @@
-/*
-Copyright 2022 The Microsoft DeepSpeed Team
-*/
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
 
 #pragma once
 
 #include "conversion_utils.h"
-#include "compatible.h"
+#include "ds_kernel_utils.h"
 #include "memory_access_utils.h"
+
+namespace cg = cooperative_groups;
 
 namespace reduce {
 
@@ -24,32 +27,53 @@ enum class ROpType {
 constexpr int max_threads = 1024;
 constexpr int max_warps = max_threads / hw_warp_size;
 
+/*
+High level API. The API takes in a set of operations and variables
+and performs that reduction operation on that variable. The reductions
+of each of the arguments are completely independent of each other (
+i.e., the val1-op1 combination has no impact on val2-op2).
 
+Example usage:
+``` cpp
+float max_val;
+float min_val;
+reduce::block<rop::Max, rop::Min>(tb, warp, max_val, min_val);
+```
+
+TODO(cmikeh2): In theory, we might be able to do this sequentially with
+device functions and rely on the assembler correctly behaving. My initial
+instinct is this won't work, but if it does it would reduce implementation
+cost significantly.
+
+TODO(cmikeh2): We need to support sub-block reductions. The warp intrinsic
+currently supports this (more incidentally than anything else). It is not
+uncommon in something like softmax or a fused attention kernel to map multiple
+reductions to a thread block, but each reduction itself is only scoped
+to part of the threads (i.e block size = 512, 128 threads per reduction).
+*/
 template <ROpType Op, int warp_bound = max_warps>
-void block(sycl::group<2>& tb, 
-           sycl::sub_group& warp, 
-           float& val);
+DS_D_INLINE void block(cg::thread_block& tb, cg::thread_block_tile<hw_warp_size>& warp, float& val);
 
 template <ROpType Op1, ROpType Op2, int warp_bound = max_warps>
-void block(sycl::group<2>& tb,
-           sycl::sub_group& warp,
-           float& val1,
-           float& val2);
+DS_D_INLINE void block(cg::thread_block& tb,
+                       cg::thread_block_tile<hw_warp_size>& warp,
+                       float& val1,
+                       float& val2);
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, int warp_bound = max_warps>
-void block(sycl::group<2>& tb,
-                       sycl::sub_group& warp,
+DS_D_INLINE void block(cg::thread_block& tb,
+                       cg::thread_block_tile<hw_warp_size>& warp,
                        float& val1,
                        float& val2,
                        float& val3);
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, ROpType Op4, int warp_bound = max_warps>
-void block(sycl::group<2>& tb,
-           sycl::sub_group& warp,
-           float& val1,
-           float& val2,
-           float& val3,
-           float& val4);
+DS_D_INLINE void block(cg::thread_block& tb,
+                       cg::thread_block_tile<hw_warp_size>& warp,
+                       float& val1,
+                       float& val2,
+                       float& val3,
+                       float& val4);
 
 /*
 The partitioned block is a special case of the above where in the warps of a threadblock are
@@ -64,26 +88,26 @@ After which, each pair of warps would have coherent data with each other. Note, 
 provide correct results if the number of warps per partition is not a power of 2.
 */
 template <ROpType Op, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                                   sycl::sub_group& warp,
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
                                    float& val);
 
 template <ROpType Op1, ROpType Op2, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                                   sycl::sub_group& warp,
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
                                    float& val1,
                                    float& val2);
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                                   sycl::sub_group& warp,
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
                                    float& val1,
                                    float& val2,
                                    float& val3);
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, ROpType Op4, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                                   sycl::sub_group& warp,
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
                                    float& val1,
                                    float& val2,
                                    float& val3,
@@ -102,10 +126,10 @@ for (int i = 0; i < 4; i++) {
 */
 
 template <ROpType Op, typename T>
-T element(const T lhs, const T rhs);
+DS_D_INLINE T element(const T lhs, const T rhs);
 
 template <ROpType OType, typename T = float>
-T init();
+DS_D_INLINE T init();
 
 /********************** Internal reduction APIs **********************/
 
@@ -123,147 +147,165 @@ would be a good extension of the header.
 
 /* Float element reduce implementations */
 template <>
-float element<ROpType::Add>(const float lhs, const float rhs)
+DS_D_INLINE float element<ROpType::Add>(const float lhs, const float rhs)
 {
     return lhs + rhs;
 }
 
 template <>
-float element<ROpType::Max>(const float lhs, const float rhs)
+DS_D_INLINE float element<ROpType::Max>(const float lhs, const float rhs)
 {
     return fmaxf(lhs, rhs);
 }
 
 template <>
-float element<ROpType::Min>(const float lhs, const float rhs)
+DS_D_INLINE float element<ROpType::Min>(const float lhs, const float rhs)
 {
     return fminf(lhs, rhs);
 }
 
-/* sycl::half element reduce implementation */
+/* __half element reduce implementation */
 template <>
-sycl::half element<ROpType::Add>(const sycl::half lhs, const sycl::half rhs)
+DS_D_INLINE __half element<ROpType::Add>(const __half lhs, const __half rhs)
 {
     return lhs + rhs;
 }
 
 template <>
-sycl::half element<ROpType::Max>(const sycl::half lhs, const sycl::half rhs)
+DS_D_INLINE __half element<ROpType::Max>(const __half lhs, const __half rhs)
 {
+#if __CUDA_ARCH__ >= 800
+    // Intrinsic limited to Ampere + newer
+    return __hmax(lhs, rhs);
+#else
     return (lhs > rhs) ? lhs : rhs;
+#endif
 }
 
 template <>
-sycl::half element<ROpType::Min>(const sycl::half lhs, const sycl::half rhs)
+DS_D_INLINE __half element<ROpType::Min>(const __half lhs, const __half rhs)
 {
+#if __CUDA_ARCH__ >= 800
+    // Intrinsic limited to Ampere + newer
+    return __hmin(lhs, rhs);
+#else
     return (lhs < rhs) ? lhs : rhs;
+#endif
 }
 
-/* sycl::half2 element reduce implementation */
+/* __half2 element reduce implementation */
 template <>
-sycl::half2 element<ROpType::Add>(const sycl::half2 lhs, const sycl::half2 rhs)
+DS_D_INLINE __half2 element<ROpType::Add>(const __half2 lhs, const __half2 rhs)
 {
     return lhs + rhs;
 }
 
 template <>
-sycl::half2 element<ROpType::Max>(const sycl::half2 lhs, const sycl::half2 rhs)
+DS_D_INLINE __half2 element<ROpType::Max>(const __half2 lhs, const __half2 rhs)
 {
-    sycl::half2 ret_val;
-    ret_val[0] = (lhs[0] > rhs[0]) ? lhs[0] : rhs[0];
-    ret_val[1] = (lhs[1] > rhs[1]) ? lhs[1] : rhs[1];
+#if __CUDA_ARCH__ >= 800
+    return __hmax2(lhs, rhs);
+#else
+    __half2 ret_val;
+    ret_val.x = (lhs.x > rhs.x) ? lhs.x : rhs.x;
+    ret_val.y = (lhs.y > rhs.y) ? lhs.y : rhs.y;
     return ret_val;
+#endif
 }
 
 template <>
-sycl::half2 element<ROpType::Min>(const sycl::half2 lhs, const sycl::half2 rhs)
+DS_D_INLINE __half2 element<ROpType::Min>(const __half2 lhs, const __half2 rhs)
 {
-    sycl::half2 ret_val;
-    ret_val[0] = (lhs[0] < rhs[0]) ? lhs[0] : rhs[0];
-    ret_val[1] = (lhs[1] < rhs[1]) ? lhs[1] : rhs[1];
+#if __CUDA_ARCH__ >= 800
+    return __hmin2(lhs, rhs);
+#else
+    __half2 ret_val;
+    ret_val.x = (lhs.x < rhs.x) ? lhs.x : rhs.x;
+    ret_val.y = (lhs.y < rhs.y) ? lhs.y : rhs.y;
     return ret_val;
+#endif
 }
 
 /*
 Reduction initialization primitives
 */
 template <>
-float init<ROpType::Add>()
+DS_D_INLINE float init<ROpType::Add>()
 {
     return 0.0f;
 }
 
 template <>
-float init<ROpType::Min>()
+DS_D_INLINE float init<ROpType::Min>()
 {
     // Positive infinity
     return INFINITY;
 }
 
 template <>
-float init<ROpType::Max>()
+DS_D_INLINE float init<ROpType::Max>()
 {
     // Negative infinity
     return -INFINITY;
 }
 
 template <>
-sycl::half init<ROpType::Add>()
+DS_D_INLINE __half init<ROpType::Add>()
 {
-    constexpr sycl::half zero = 0.0;
-    return sycl::half(zero);
+    constexpr __half_raw zero = {0x0000};
+    return __half(zero);
 }
 
 template <>
-sycl::half init<ROpType::Min>()
+DS_D_INLINE __half init<ROpType::Min>()
 {
-    constexpr sycl::half inf = std::numeric_limits<sycl::half>::infinity();
-    return sycl::half(inf);
+    constexpr __half_raw inf = {0x7C00};
+    return __half(inf);
 }
 
 template <>
-sycl::half init<ROpType::Max>()
+DS_D_INLINE __half init<ROpType::Max>()
 {
-    constexpr sycl::half neg_inf = -std::numeric_limits<sycl::half>::infinity();
-    return sycl::half(neg_inf);
+    constexpr __half_raw neg_inf = {0xFC00};
+    return __half(neg_inf);
 }
 
 template <>
-sycl::half2 init<ROpType::Add>()
+DS_D_INLINE __half2 init<ROpType::Add>()
 {
-    /* constexpr sycl::half2 zero = {0x0000, 0x0000}; */
-    return {0.0, 0.0};
+    constexpr __half2_raw zero = {0x0000, 0x0000};
+    return __half2(zero);
 }
 
 template <>
-sycl::half2 init<ROpType::Min>()
+DS_D_INLINE __half2 init<ROpType::Min>()
 {
-    /* constexpr sycl::half2 inf = {0x7C00, 0x7C00}; */
-    return {std::numeric_limits<sycl::half>::infinity(), std::numeric_limits<sycl::half>::infinity()};
+    constexpr __half2_raw inf = {0x7C00, 0x7C00};
+    return __half2(inf);
 }
 
 template <>
-sycl::half2 init<ROpType::Max>()
+DS_D_INLINE __half2 init<ROpType::Max>()
 {
-    /* constexpr sycl::half2 neg_inf = {0xFC00, 0xFC00}; */
-    return {-std::numeric_limits<sycl::half>::infinity(), -std::numeric_limits<sycl::half>::infinity()};
+    constexpr __half2_raw neg_inf = {0xFC00, 0xFC00};
+    return __half2(neg_inf);
 }
 
 template <ROpType Op, typename T>
-void init(T* data)
+DS_D_INLINE void init(T* data)
 {
     data[0] = init<Op, T>();
 }
 
 template <ROpType Op1, ROpType Op2, typename T>
-void init(T* data)
+DS_D_INLINE void init(T* data)
 {
     data[0] = init<Op1, T>();
     data[1] = init<Op2, T>();
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, typename T>
-void init(T* data)
+DS_D_INLINE void init(T* data)
 {
     data[0] = init<Op1, T>();
     data[1] = init<Op2, T>();
@@ -271,7 +313,7 @@ void init(T* data)
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, ROpType Op4, typename T>
-void init(T* data)
+DS_D_INLINE void init(T* data)
 {
     data[0] = init<Op1, T>();
     data[1] = init<Op2, T>();
@@ -292,44 +334,44 @@ huge overkill that harms readability) that would be wonderful.
 */
 
 template <ROpType Op, int reduce_width = hw_warp_size>
-void _warp(sycl::sub_group& warp, float* data)
+DS_D_INLINE void _warp(cg::thread_block_tile<hw_warp_size>& warp, float* data)
 {
 #pragma unroll
     for (int i = 1; i < reduce_width; i *= 2) {
-        data[0] = element<Op>(data[0], warp.shuffle_xor(data[0], i));
+        data[0] = element<Op>(data[0], warp.shfl_xor(data[0], i));
     }
 }
 
 template <ROpType Op1, ROpType Op2, int reduce_width = hw_warp_size>
-void _warp(sycl::sub_group& warp, float* data)
+DS_D_INLINE void _warp(cg::thread_block_tile<hw_warp_size>& warp, float* data)
 {
 #pragma unroll
     for (int i = 1; i < reduce_width; i *= 2) {
-        data[0] = element<Op1>(data[0], warp.shuffle_xor(data[0], i));
-        data[1] = element<Op2>(data[1], warp.shuffle_xor(data[1], i));
+        data[0] = element<Op1>(data[0], warp.shfl_xor(data[0], i));
+        data[1] = element<Op2>(data[1], warp.shfl_xor(data[1], i));
     }
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, int reduce_width = hw_warp_size>
-void _warp(sycl::sub_group& warp, float* data)
+DS_D_INLINE void _warp(cg::thread_block_tile<hw_warp_size>& warp, float* data)
 {
 #pragma unroll
     for (int i = 1; i < reduce_width; i *= 2) {
-        data[0] = element<Op1>(data[0], warp.shuffle_xor(data[0], i));
-        data[1] = element<Op2>(data[1], warp.shuffle_xor(data[1], i));
-        data[2] = element<Op3>(data[2], warp.shuffle_xor(data[2], i));
+        data[0] = element<Op1>(data[0], warp.shfl_xor(data[0], i));
+        data[1] = element<Op2>(data[1], warp.shfl_xor(data[1], i));
+        data[2] = element<Op3>(data[2], warp.shfl_xor(data[2], i));
     }
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, ROpType Op4, int reduce_width = hw_warp_size>
-void _warp(sycl::sub_group& warp, float* data)
+DS_D_INLINE void _warp(cg::thread_block_tile<hw_warp_size>& warp, float* data)
 {
 #pragma unroll
     for (int i = 1; i < reduce_width; i *= 2) {
-        data[0] = element<Op1>(data[0], warp.shuffle_xor(data[0], i));
-        data[1] = element<Op2>(data[1], warp.shuffle_xor(data[1], i));
-        data[2] = element<Op3>(data[2], warp.shuffle_xor(data[2], i));
-        data[3] = element<Op4>(data[3], warp.shuffle_xor(data[3], i));
+        data[0] = element<Op1>(data[0], warp.shfl_xor(data[0], i));
+        data[1] = element<Op2>(data[1], warp.shfl_xor(data[1], i));
+        data[2] = element<Op3>(data[2], warp.shfl_xor(data[2], i));
+        data[3] = element<Op4>(data[3], warp.shfl_xor(data[3], i));
     }
 }
 
@@ -350,8 +392,8 @@ block in the default case). This enables us to only perform the warp reduction
 when able to.
 */
 template <int total_warps, ROpType... Ops>
-void _block(sycl::group<2>& tb,
-                        sycl::sub_group& warp_arg,
+DS_D_INLINE void _block(cg::thread_block& tb,
+                        cg::thread_block_tile<hw_warp_size>& warp_arg,
                         float* data,
                         int warp_offset)
 {
@@ -359,33 +401,30 @@ void _block(sycl::group<2>& tb,
     // Separated for now in case this no longer is true
     constexpr int bytes = sizeof(float);
     // Unused when `partition_size == 1` or total_warps == 1
-    /* __shared__ float reduce_buffer[max_warps * elems]; */
-    auto reduce_buffer = __group_local_memory<float[max_warps * elems]>(tb);
+    __shared__ float reduce_buffer[max_warps * elems];
 
     // Always perform warp-scope reduction
     _warp<Ops...>(warp_arg, data);
 
     // If max_warps == 1 let's skip the runtime check
-    // TODO: meta_group_size replacement
-    if (warp_arg.get_group_range().size() > 1 && total_warps != 1) {
-        if (warp_arg.get_local_id() == 0) {
+    if (warp_arg.meta_group_size() > 1 && total_warps != 1) {
+        if (warp_arg.thread_rank() == 0) {
 #pragma unroll
             for (int i = 0; i < elems; i++) {
                 mem_access::store_shared<bytes>(
-                    reduce_buffer + elems * warp_arg.get_group_id() + i, data + i);
+                    reduce_buffer + elems * warp_arg.meta_group_rank() + i, data + i);
             }
         }
 
         // Synchronization inside block-uniform conditional is safe
-        /* tb.sync(); */
-        sycl::group_barrier(tb, tb.fence_scope);
+        tb.sync();
 
-        if (warp_arg.get_group_id() == 0) {
-            if (warp_arg.get_local_id() < warp_arg.get_group_range()) {
+        if (warp_arg.meta_group_rank() == 0) {
+            if (warp_arg.thread_rank() < warp_arg.meta_group_size()) {
 #pragma unroll
                 for (int i = 0; i < elems; i++) {
                     mem_access::load_shared<bytes>(
-                        data + i, reduce_buffer + elems * warp_arg.get_local_id() + i);
+                        data + i, reduce_buffer + elems * warp_arg.thread_rank() + i);
                 }
             } else {
                 init<Ops...>(data);
@@ -395,19 +434,18 @@ void _block(sycl::group<2>& tb,
 
 #pragma unroll
             for (int i = 0; i < elems; i++) {
-                mem_access::store_shared<bytes>(reduce_buffer + elems * warp_arg.get_local_id() + i,
+                mem_access::store_shared<bytes>(reduce_buffer + elems * warp_arg.thread_rank() + i,
                                                 data + i);
             }
         }
 
         // Synchronization inside block-uniform conditional is safe
-        /* tb.sync(); */
-        sycl::group_barrier(tb, tb.fence_scope);
+        tb.sync();
 
 #pragma unroll
         for (int i = 0; i < elems; i++) {
             mem_access::load_shared<bytes>(data + i,
-                                           reduce_buffer + warp_arg.get_group_id() * elems + i);
+                                           reduce_buffer + warp_arg.meta_group_rank() * elems + i);
         }
     }
 }
@@ -420,15 +458,14 @@ option, but the nature of using a pointer is a little less safe and this allows
 us to obfuscate the details of the partitioned implementation.
 */
 template <ROpType Op, int warp_bound>
-void block(sycl::group<2>& tb, 
-           sycl::sub_group& warp, float& val)
+DS_D_INLINE void block(cg::thread_block& tb, cg::thread_block_tile<hw_warp_size>& warp, float& val)
 {
     _block<warp_bound, Op>(tb, warp, &val, 0);
 }
 
 template <ROpType Op1, ROpType Op2, int warp_bound>
-void block(sycl::group<2>& tb,
-                       sycl::sub_group& warp,
+DS_D_INLINE void block(cg::thread_block& tb,
+                       cg::thread_block_tile<hw_warp_size>& warp,
                        float& val1,
                        float& val2)
 {
@@ -439,8 +476,8 @@ void block(sycl::group<2>& tb,
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, int warp_bound>
-void block(sycl::group<2>& tb,
-                       sycl::sub_group& warp,
+DS_D_INLINE void block(cg::thread_block& tb,
+                       cg::thread_block_tile<hw_warp_size>& warp,
                        float& val1,
                        float& val2,
                        float& val3)
@@ -453,12 +490,12 @@ void block(sycl::group<2>& tb,
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, ROpType Op4, int warp_bound>
-void block(sycl::group<2>& tb,
-           sycl::sub_group& warp,
-           float& val1,
-           float& val2,
-           float& val3,
-           float& val4)
+DS_D_INLINE void block(cg::thread_block& tb,
+                       cg::thread_block_tile<hw_warp_size>& warp,
+                       float& val1,
+                       float& val2,
+                       float& val3,
+                       float& val4)
 {
     float data[4] = {val1, val2, val3, val4};
     _block<warp_bound, Op1, Op2, Op3, Op4>(tb, warp, data, 0);
@@ -473,22 +510,22 @@ Note: for the partitioned blocks, the implementation does not support non-power 
 to shorten block scale reduction length.
 */
 template <ROpType Op, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                       sycl::sub_group& warp,
-                       float& val)
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
+                                   float& val)
 {
     if (num_threads <= hw_warp_size) {
         _warp<Op, num_threads>(warp, &val);
     } else {
         constexpr int num_warps = num_threads / hw_warp_size;
-        const int warp_offset = warp.get_group_id() & ~(num_warps - 1);
+        const int warp_offset = warp.meta_group_rank() & ~(num_warps - 1);
         _block<num_warps, Op>(tb, warp, &val, warp_offset);
     }
 }
 
 template <ROpType Op1, ROpType Op2, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                                   sycl::sub_group& warp,
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
                                    float& val1,
                                    float& val2)
 {
@@ -498,7 +535,7 @@ void partitioned_block(sycl::group<2>& tb,
         _warp<Op1, Op2, num_threads>(warp, data);
     } else {
         constexpr int num_warps = num_threads / hw_warp_size;
-        const int warp_offset = warp.get_group_id() & ~(num_warps - 1);
+        const int warp_offset = warp.meta_group_rank() & ~(num_warps - 1);
         _block<num_warps, Op1, Op2>(tb, warp, data, warp_offset);
     }
 
@@ -507,8 +544,8 @@ void partitioned_block(sycl::group<2>& tb,
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                                   sycl::sub_group& warp,
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
                                    float& val1,
                                    float& val2,
                                    float& val3)
@@ -519,7 +556,7 @@ void partitioned_block(sycl::group<2>& tb,
         _warp<Op1, Op2, Op3, num_threads>(warp, data);
     } else {
         constexpr int num_warps = num_threads / hw_warp_size;
-        const int warp_offset = warp.get_group_id() & ~(num_warps - 1);
+        const int warp_offset = warp.meta_group_rank() & ~(num_warps - 1);
         _block<num_warps, Op1, Op2, Op3>(tb, warp, data, warp_offset);
     }
 
@@ -529,12 +566,12 @@ void partitioned_block(sycl::group<2>& tb,
 }
 
 template <ROpType Op1, ROpType Op2, ROpType Op3, ROpType Op4, int num_threads>
-void partitioned_block(sycl::group<2>& tb,
-                       sycl::sub_group& warp,
-                       float& val1,
-                       float& val2,
-                       float& val3,
-                       float& val4)
+DS_D_INLINE void partitioned_block(cg::thread_block& tb,
+                                   cg::thread_block_tile<hw_warp_size>& warp,
+                                   float& val1,
+                                   float& val2,
+                                   float& val3,
+                                   float& val4)
 {
     float data[4] = {val1, val2, val3, val4};
 
@@ -542,7 +579,7 @@ void partitioned_block(sycl::group<2>& tb,
         _warp<Op1, Op2, Op3, Op4, num_threads>(warp, data);
     } else {
         constexpr int num_warps = num_threads / hw_warp_size;
-        const int warp_offset = warp.get_group_id() & ~(num_warps - 1);
+        const int warp_offset = warp.meta_group_rank() & ~(num_warps - 1);
         _block<num_warps, Op1, Op2, Op3, Op4>(tb, warp, data, warp_offset);
     }
 

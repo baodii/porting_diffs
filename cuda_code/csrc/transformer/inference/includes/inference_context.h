@@ -16,6 +16,7 @@
 #define MEGABYTE (1024 * 1024)
 #define GIGABYTE (1024 * 1024 * 1024)
 
+// TODO: refactor out
 #define WARP_SIZE 32
 
 #define CUDA_CHECK(callstr)                                                                    \
